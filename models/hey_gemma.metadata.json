@@ -1,0 +1,425 @@
+{
+  "phrase": "Hey Gemma",
+  "status": "experimental-synthetic-bootstrap",
+  "model": "hey_gemma.onnx",
+  "model_sha256": "56b347b54ac981192fd8cbb0f2ff468f15576d62f3bbc001a724b1a0a6d6c1c6",
+  "recommended_threshold": 0.9,
+  "input": [
+    "batch",
+    16,
+    96
+  ],
+  "output": [
+    "batch",
+    1
+  ],
+  "audio": "16 kHz mono int16 PCM",
+  "engine": "openWakeWord 0.6.0 ONNX",
+  "seed": 427,
+  "classifier": "standardized logistic regression; normalization folded into ONNX weights",
+  "head": "linear",
+  "train_voices": [
+    "Samantha (English (US))",
+    "Daniel",
+    "Karen",
+    "Rishi",
+    "Tessa",
+    "Fred"
+  ],
+  "validation_voices": [
+    "Moira"
+  ],
+  "test_voices": [
+    "Eddy (English (US))",
+    "Flo (English (US))"
+  ],
+  "train_windows": 1604,
+  "validation": {
+    "positive_windows": 24,
+    "negative_windows": 178,
+    "true_positive_rate": 0.9166666666666666,
+    "false_positive_rate_per_window": 0.0056179775280898875,
+    "roc_auc": 0.9978932584269663,
+    "threshold": 0.74
+  },
+  "held_out_synthetic_test": {
+    "positive_windows": 48,
+    "negative_windows": 336,
+    "true_positive_rate": 0.7708333333333334,
+    "false_positive_rate_per_window": 0.002976190476190476,
+    "roc_auc": 0.9972098214285714,
+    "threshold": 0.74
+  },
+  "backbone_sources": {
+    "melspectrogram.onnx": {
+      "url": "https://github.com/dscripka/openWakeWord/releases/download/v0.5.1/melspectrogram.onnx",
+      "sha256": "ba2b0e0f8b7b875369a2c89cb13360ff53bac436f2895cced9f479fa65eb176f"
+    },
+    "embedding_model.onnx": {
+      "url": "https://github.com/dscripka/openWakeWord/releases/download/v0.5.1/embedding_model.onnx",
+      "sha256": "70d164290c1d095d1d4ee149bc5e00543250a7316b59f31d056cff7bd3075c1f"
+    }
+  },
+  "synthetic_audio_source": "locally installed macOS say voices",
+  "duration_seconds": 0.15,
+  "limitations": [
+    "No real microphone recordings evaluated.",
+    "Small synthetic dataset; unrelated natural speech, TV, music and room noise are not adequately represented.",
+    "Per-window synthetic false positives do not establish false activations per hour.",
+    "Validate on real speakers, distances and room noise before relying on detection.",
+    "Bootstrap trained with Apple system voices; redistribution/commercial licensing has not been established.",
+    "Streaming synthetic false-trigger target was not met; similar names such as Hey Jenna, Hey Gina and Hey Gemini can activate this experimental prototype."
+  ],
+  "recipe": "tools/train_wakeword.py",
+  "positive_phrases": [
+    "Hey Gemma.",
+    "Hey, Gemma!",
+    "Hey Gemma?",
+    "Hey Jemma."
+  ],
+  "negative_phrases": [
+    "Gemma",
+    "Hey",
+    "Hey Emma",
+    "Hey Jenna",
+    "Hey Gamma",
+    "Hey Hannah",
+    "Hey Gem",
+    "Hey Jim",
+    "Hey James",
+    "Hey Janet",
+    "Hey Gina",
+    "Hey Jennifer",
+    "Hey grandma",
+    "Hey mama",
+    "Hey Kendra",
+    "Okay Gemma",
+    "Gemma is here",
+    "I met Gemma yesterday",
+    "Gemma told me",
+    "What is Gemma?",
+    "Hey Siri",
+    "Hey Google",
+    "Hey Jarvis",
+    "Alexa",
+    "Hello there",
+    "Good morning",
+    "Good evening",
+    "Thank you",
+    "You're welcome",
+    "How are you?",
+    "What is your name?",
+    "What time is it?",
+    "Turn off the kitchen lights",
+    "Turn on the kitchen lights",
+    "Close the garage",
+    "Open the garage",
+    "Turn them back on",
+    "Don't close the garage",
+    "Stop",
+    "Cancel that",
+    "Never mind",
+    "Please wait",
+    "The lights are off",
+    "The garage is closed",
+    "Can you help me?",
+    "Where are my keys?",
+    "Have a good day",
+    "The weather is nice",
+    "I am making dinner",
+    "Let's watch television",
+    "Turn up the music",
+    "Would you like some coffee?",
+    "We should leave soon",
+    "I need to go shopping",
+    "Pick up the phone",
+    "Call me later",
+    "See you tomorrow",
+    "A very good idea",
+    "It is raining outside",
+    "The dog is sleeping",
+    "We live in California",
+    "That is my friend",
+    "The train is coming",
+    "What's for dinner?",
+    "Can you hear me?",
+    "Testing one two three",
+    "Go to the gym",
+    "Get the camera",
+    "A game of chess",
+    "Hey, give me a minute",
+    "Hey, get me some water",
+    "Hey gentleman",
+    "Hey Germany",
+    "Hey Gemini",
+    "Hey gems",
+    "Hey, jump up",
+    "Play jazz music",
+    "Happy birthday",
+    "I remember now"
+  ],
+  "streaming_evaluation": {
+    "model_sha256": "56b347b54ac981192fd8cbb0f2ff468f15576d62f3bbc001a724b1a0a6d6c1c6",
+    "recommended_threshold": 0.9,
+    "frame_ms": 80,
+    "consecutive_frames": 2,
+    "threshold_selected_using": "Explicit prototype threshold; favors wake recall, not a claim of meeting calibration targets",
+    "validation_target_met": false,
+    "validation": {
+      "positive_clips": 8,
+      "detected_positive_clips": 8,
+      "negative_clips": 158,
+      "false_trigger_clips": 5,
+      "recall": 1.0,
+      "false_trigger_fraction": 0.03164556962025317,
+      "threshold": 0.9,
+      "consecutive_frames": 2,
+      "false_trigger_examples": [
+        "Hey Emma",
+        "Hey Jenna",
+        "Hey Jenna",
+        "Hey Jennifer",
+        "Hey Gemini"
+      ]
+    },
+    "test": {
+      "positive_clips": 16,
+      "detected_positive_clips": 16,
+      "negative_clips": 316,
+      "false_trigger_clips": 7,
+      "recall": 1.0,
+      "false_trigger_fraction": 0.022151898734177215,
+      "threshold": 0.9,
+      "consecutive_frames": 2,
+      "false_trigger_examples": [
+        "Hey Jenna",
+        "Okay Gemma",
+        "Hey Gemini",
+        "Hey Jenna",
+        "Hey Gina",
+        "Hey Gina",
+        "Hey Gemini"
+      ]
+    },
+    "connected_commands": [
+      {
+        "voice": "Eddy (English (US))",
+        "speed": 145,
+        "command": "Turn off the kitchen lights",
+        "kind": "joined-no-pause",
+        "trigger_seconds_after_audio_start": 0.9199999999999999,
+        "delay_after_exact_joined_wake_end": 0.11649999999999994,
+        "sustained_max": 0.9389544725418091
+      },
+      {
+        "voice": "Eddy (English (US))",
+        "speed": 145,
+        "command": "Turn off the kitchen lights",
+        "kind": "natural-connected",
+        "trigger_seconds_after_audio_start": 0.8400000000000001,
+        "delay_after_exact_joined_wake_end": null,
+        "sustained_max": 0.9203503131866455
+      },
+      {
+        "voice": "Eddy (English (US))",
+        "speed": 145,
+        "command": "Close the garage",
+        "kind": "joined-no-pause",
+        "trigger_seconds_after_audio_start": 0.9199999999999999,
+        "delay_after_exact_joined_wake_end": 0.11649999999999994,
+        "sustained_max": 0.9458125233650208
+      },
+      {
+        "voice": "Eddy (English (US))",
+        "speed": 145,
+        "command": "Close the garage",
+        "kind": "natural-connected",
+        "trigger_seconds_after_audio_start": 0.8400000000000001,
+        "delay_after_exact_joined_wake_end": null,
+        "sustained_max": 0.9216041564941406
+      },
+      {
+        "voice": "Eddy (English (US))",
+        "speed": 145,
+        "command": "What is your name?",
+        "kind": "joined-no-pause",
+        "trigger_seconds_after_audio_start": 0.9199999999999999,
+        "delay_after_exact_joined_wake_end": 0.11649999999999994,
+        "sustained_max": 0.9288344383239746
+      },
+      {
+        "voice": "Eddy (English (US))",
+        "speed": 145,
+        "command": "What is your name?",
+        "kind": "natural-connected",
+        "trigger_seconds_after_audio_start": 0.8400000000000001,
+        "delay_after_exact_joined_wake_end": null,
+        "sustained_max": 0.9175518751144409
+      },
+      {
+        "voice": "Eddy (English (US))",
+        "speed": 190,
+        "command": "Turn off the kitchen lights",
+        "kind": "joined-no-pause",
+        "trigger_seconds_after_audio_start": 0.8400000000000001,
+        "delay_after_exact_joined_wake_end": 0.15400000000000003,
+        "sustained_max": 0.9404664039611816
+      },
+      {
+        "voice": "Eddy (English (US))",
+        "speed": 190,
+        "command": "Turn off the kitchen lights",
+        "kind": "natural-connected",
+        "trigger_seconds_after_audio_start": 0.8400000000000001,
+        "delay_after_exact_joined_wake_end": null,
+        "sustained_max": 0.9007296562194824
+      },
+      {
+        "voice": "Eddy (English (US))",
+        "speed": 190,
+        "command": "Close the garage",
+        "kind": "joined-no-pause",
+        "trigger_seconds_after_audio_start": 0.8400000000000001,
+        "delay_after_exact_joined_wake_end": 0.15400000000000003,
+        "sustained_max": 0.9383626580238342
+      },
+      {
+        "voice": "Eddy (English (US))",
+        "speed": 190,
+        "command": "Close the garage",
+        "kind": "natural-connected",
+        "trigger_seconds_after_audio_start": 0.8400000000000001,
+        "delay_after_exact_joined_wake_end": null,
+        "sustained_max": 0.9057671427726746
+      },
+      {
+        "voice": "Eddy (English (US))",
+        "speed": 190,
+        "command": "What is your name?",
+        "kind": "joined-no-pause",
+        "trigger_seconds_after_audio_start": 0.8400000000000001,
+        "delay_after_exact_joined_wake_end": 0.15400000000000003,
+        "sustained_max": 0.9145816564559937
+      },
+      {
+        "voice": "Eddy (English (US))",
+        "speed": 190,
+        "command": "What is your name?",
+        "kind": "natural-connected",
+        "trigger_seconds_after_audio_start": null,
+        "delay_after_exact_joined_wake_end": null,
+        "sustained_max": 0.8859511613845825
+      },
+      {
+        "voice": "Flo (English (US))",
+        "speed": 145,
+        "command": "Turn off the kitchen lights",
+        "kind": "joined-no-pause",
+        "trigger_seconds_after_audio_start": 0.8400000000000001,
+        "delay_after_exact_joined_wake_end": 0.037687500000000096,
+        "sustained_max": 0.9578723311424255
+      },
+      {
+        "voice": "Flo (English (US))",
+        "speed": 145,
+        "command": "Turn off the kitchen lights",
+        "kind": "natural-connected",
+        "trigger_seconds_after_audio_start": 0.8400000000000001,
+        "delay_after_exact_joined_wake_end": null,
+        "sustained_max": 0.9789556860923767
+      },
+      {
+        "voice": "Flo (English (US))",
+        "speed": 145,
+        "command": "Close the garage",
+        "kind": "joined-no-pause",
+        "trigger_seconds_after_audio_start": 0.8400000000000001,
+        "delay_after_exact_joined_wake_end": 0.037687500000000096,
+        "sustained_max": 0.9465093612670898
+      },
+      {
+        "voice": "Flo (English (US))",
+        "speed": 145,
+        "command": "Close the garage",
+        "kind": "natural-connected",
+        "trigger_seconds_after_audio_start": 0.8400000000000001,
+        "delay_after_exact_joined_wake_end": null,
+        "sustained_max": 0.9788790941238403
+      },
+      {
+        "voice": "Flo (English (US))",
+        "speed": 145,
+        "command": "What is your name?",
+        "kind": "joined-no-pause",
+        "trigger_seconds_after_audio_start": 0.8400000000000001,
+        "delay_after_exact_joined_wake_end": 0.037687500000000096,
+        "sustained_max": 0.9346530437469482
+      },
+      {
+        "voice": "Flo (English (US))",
+        "speed": 145,
+        "command": "What is your name?",
+        "kind": "natural-connected",
+        "trigger_seconds_after_audio_start": 0.8400000000000001,
+        "delay_after_exact_joined_wake_end": null,
+        "sustained_max": 0.9774457216262817
+      },
+      {
+        "voice": "Flo (English (US))",
+        "speed": 190,
+        "command": "Turn off the kitchen lights",
+        "kind": "joined-no-pause",
+        "trigger_seconds_after_audio_start": 0.8400000000000001,
+        "delay_after_exact_joined_wake_end": 0.15537500000000004,
+        "sustained_max": 0.9618991613388062
+      },
+      {
+        "voice": "Flo (English (US))",
+        "speed": 190,
+        "command": "Turn off the kitchen lights",
+        "kind": "natural-connected",
+        "trigger_seconds_after_audio_start": 0.8400000000000001,
+        "delay_after_exact_joined_wake_end": null,
+        "sustained_max": 0.9742283821105957
+      },
+      {
+        "voice": "Flo (English (US))",
+        "speed": 190,
+        "command": "Close the garage",
+        "kind": "joined-no-pause",
+        "trigger_seconds_after_audio_start": 0.8400000000000001,
+        "delay_after_exact_joined_wake_end": 0.15537500000000004,
+        "sustained_max": 0.9611680507659912
+      },
+      {
+        "voice": "Flo (English (US))",
+        "speed": 190,
+        "command": "Close the garage",
+        "kind": "natural-connected",
+        "trigger_seconds_after_audio_start": 0.8400000000000001,
+        "delay_after_exact_joined_wake_end": null,
+        "sustained_max": 0.973801851272583
+      },
+      {
+        "voice": "Flo (English (US))",
+        "speed": 190,
+        "command": "What is your name?",
+        "kind": "joined-no-pause",
+        "trigger_seconds_after_audio_start": 0.8400000000000001,
+        "delay_after_exact_joined_wake_end": 0.15537500000000004,
+        "sustained_max": 0.9254127740859985
+      },
+      {
+        "voice": "Flo (English (US))",
+        "speed": 190,
+        "command": "What is your name?",
+        "kind": "natural-connected",
+        "trigger_seconds_after_audio_start": 0.8400000000000001,
+        "delay_after_exact_joined_wake_end": null,
+        "sustained_max": 0.9669169187545776
+      }
+    ],
+    "evaluation_seconds": 68.45,
+    "limitations": "Synthetic voices only, test set used diagnostically during development; no real room/microphone evaluation. No false-activations/hour estimate."
+  }
+}
