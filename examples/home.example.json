@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "integrations": {
+    "homebridge": {
+      "type": "homebridge",
+      "url": "http://127.0.0.1:8581",
+      "token_env": "APM_HOMEBRIDGE_TOKEN",
+      "timeout": 5
+    },
+    "matter": {
+      "type": "matter",
+      "url": "ws://127.0.0.1:5580/ws",
+      "timeout": 10
+    }
+  },
+  "devices": {}
+}

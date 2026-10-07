@@ -76,7 +76,9 @@ class WakeDetector:
 class SpeechDetector:
     def __init__(self):
         import webrtcvad
-        self.vad = webrtcvad.Vad(2)
+        # Mode 2 discards quiet commands that the wake-word model can still hear.
+        # Capture requires a sustained onset to reject isolated noise votes.
+        self.vad = webrtcvad.Vad(1)
 
     def is_speech(self, pcm):
         # Four 20 ms frames; reject isolated clicks.
@@ -90,8 +92,11 @@ class Capture:
     def __init__(self, pre_roll, config):
         self.config = config
         self.frames = list(pre_roll)
+        self.pre_roll_frames = len(self.frames)
         self.elapsed = 0.0
         self.speech_seconds = 0.0
+        self.speech_run = 0.0
+        self.longest_speech_run = 0.0
         self.silence = 0.0
         self.has_speech = False
 
@@ -100,10 +105,15 @@ class Capture:
         self.elapsed += BLOCK / RATE
         if speech:
             self.speech_seconds += BLOCK / RATE
+            self.speech_run += BLOCK / RATE
+            self.longest_speech_run = max(self.longest_speech_run, self.speech_run)
             self.silence = 0.0
         else:
+            self.speech_run = 0.0
             self.silence += BLOCK / RATE
-        self.has_speech = self.speech_seconds >= 0.24
+        # Separate clicks/noise bursts must not add up to a spoken command.
+        # Once speech has started, allow pauses inside the command as before.
+        self.has_speech = self.has_speech or self.speech_run >= 0.24
         # Never execute a cut-off command: the user may be about to negate it.
         if self.elapsed >= self.config.max_seconds:
             return "too_long", None
@@ -112,6 +122,16 @@ class Capture:
         if self.has_speech and self.silence >= self.config.silence_seconds:
             return "complete", np.concatenate(self.frames).astype(np.float32) / 32768.0
         return "listening", None
+
+    def diagnostics(self):
+        """Summarize capture levels without saving or exposing microphone audio."""
+        frames = self.frames[self.pre_roll_frames:]
+        samples = np.concatenate(frames).astype(np.float64) / 32768 if frames else np.zeros(1)
+        return {"capture_seconds": round(self.elapsed, 2),
+                "speech_seconds": round(self.speech_seconds, 2),
+                "longest_speech_run_seconds": round(self.longest_speech_run, 2),
+                "input_peak": round(float(np.max(np.abs(samples))), 5),
+                "input_rms": round(float(np.sqrt(np.mean(samples ** 2))), 5)}
 
 
 class Microphone:
@@ -204,12 +224,15 @@ class Speaker:
             raise
 
 
-def wait_for_command(microphone, detector, speech, config):
+def wait_for_command(microphone, detector, speech, config, debug=False):
     ring = deque(maxlen=round(config.pre_roll_seconds * RATE / BLOCK))
     detector.reset()
     with Status('Waiting for “Hey Gemma” · mic on'):
         while True:
             frame = microphone.read()
+            # Let the speech detector adapt to the current room before the wake
+            # triggers. A cold VAD can mistake startup noise for command speech.
+            speech.is_speech(frame)
             ring.append(frame)
             if detector.detect(frame):
                 break
@@ -221,7 +244,10 @@ def wait_for_command(microphone, detector, speech, config):
             frame = microphone.read()
             state, audio = capture.feed(frame, speech.is_speech(frame))
             if state != "listening":
-                return state, audio
+                break
+    if debug:
+        print("Voice capture: " + json.dumps({"state": state, **capture.diagnostics()}))
+    return state, audio
 
 
 def voice_session(model, home, request, config=None, debug=False):
@@ -238,7 +264,7 @@ def voice_session(model, home, request, config=None, debug=False):
     try:
         with Microphone(config.microphone) as microphone:
             while True:
-                state, audio = wait_for_command(microphone, detector, speech, config)
+                state, audio = wait_for_command(microphone, detector, speech, config, debug=debug)
                 microphone.pause()
                 if state == "complete":
                     try:

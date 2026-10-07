@@ -8,12 +8,26 @@ from .tools import SimulatedHome
 
 def describe_results(results):
     labels = {"kitchen_lights": "Kitchen lights", "garage": "Garage door"}
-    return " ".join(f"{labels.get(r['device'], r['device'])}: {r['state']} (simulated)." for r in results)
+    descriptions = []
+    for result in results:
+        label = result.get("label") or labels.get(result["device"], result["device"])
+        suffix = " (simulated)" if result.get("simulated", False) else ""
+        if result.get("ok") is False:
+            detail = result.get("error", "Device request failed")
+        elif result.get("accepted") and result.get("requested_state") != result["state"]:
+            detail = f"requested {result['requested_state']}; observed {result['state']}"
+        else:
+            detail = result["state"]
+        descriptions.append(f"{label}: {detail}{suffix}.")
+    return " ".join(descriptions)
 
 
 def run_request(model, home, text=None, audio=None, debug=False):
     streamed = []
     started = time.perf_counter()
+    # Refresh names, rooms and supported device IDs before every inference.
+    context = home.context()
+    model.configure_home(context)
     with Status("Preparing reply", enabled=not debug) as status:
         def emit(chunk):
             if not chunk:
@@ -24,7 +38,7 @@ def run_request(model, home, text=None, audio=None, debug=False):
             streamed.append(chunk)
             print(chunk, end="", flush=True)
         response, timing = model.predict(text, audio, on_text=None if debug else emit)
-        results = home.execute(response.get("tool_calls") or [])
+        results = home.execute(response.get("tool_calls") or [], expected_revision=context.get("revision"))
         model.commit(response, results)
     elapsed = time.perf_counter() - started
     if debug:
@@ -67,7 +81,10 @@ def interactive_session(model, home, debug=False, voice_config=None):
             print("Conversation cleared. Model remains loaded.")
             continue
         if text == "/state":
-            print(describe_results([{"device": key, "state": value["state"]} for key, value in home.devices.items()]))
+            try:
+                print(describe_results(home.snapshot()))
+            except Exception as exc:
+                print(f"State unavailable: {exc}")
             continue
         if text.startswith("/"):
             print("Available commands: /voice, /clear, /state, /quit")
@@ -105,7 +122,9 @@ def create_backend(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Local native-audio Gemma agent; simulated devices only")
+    parser = argparse.ArgumentParser(description="Local native-audio Gemma home assistant")
+    parser.add_argument("--home-config", type=Path, help="Home registry JSON; omitted means simulated devices")
+    parser.add_argument("--check-home", action="store_true", help="Validate registry and print model context without network requests")
     parser.add_argument("--backend", choices=["ollama", "transformers"], default="ollama")
     parser.add_argument("--model", help="Defaults to gemma4:e2b (Ollama) or google/gemma-4-E2B-it (Transformers)")
     parser.add_argument("--ollama-host", default="http://127.0.0.1:11434")
@@ -126,12 +145,20 @@ def main():
     group.add_argument("--record", type=float, metavar="SECONDS")
     group.add_argument("--demo", action="store_true", help="Exercise tool execution without loading a model")
     args = parser.parse_args()
+    if args.demo and args.home_config:
+        parser.error("--demo uses simulated devices; omit --home-config")
     from .voice import VoiceConfig, DEFAULT_WAKE_MODEL
     voice_config = VoiceConfig(wake_model=args.wake_model or DEFAULT_WAKE_MODEL,
                                threshold=args.wake_threshold, silence_seconds=args.silence,
                                microphone=args.mic, speak=not args.no_speak)
     home = SimulatedHome()
     try:
+        if args.home_config:
+            from .home import load_home
+            home = load_home(args.home_config)
+        if args.check_home:
+            print(json.dumps(home.context(), indent=2))
+            return
         voice_config.validate()
         if args.list_mics:
             import sounddevice as sd
@@ -170,6 +197,8 @@ def main():
         parser.exit(130, "\nAPM interrupted.\n")
     except Exception as exc:
         parser.exit(1, f"APM failed: {type(exc).__name__}: {exc}\n")
+    finally:
+        home.close()
 
 if __name__ == "__main__":
     main()

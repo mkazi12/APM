@@ -23,7 +23,19 @@ class SimulatedHome:
     def __init__(self):
         self.devices = deepcopy(DEVICES)
 
-    def execute(self, calls):
+    def context(self):
+        return {"tools": deepcopy(TOOLS), "devices": [
+            {"id": key, "name": key.replace("_", " "), "kind": value["kind"], "simulated": True}
+            for key, value in self.devices.items()]}
+
+    def snapshot(self):
+        return [{"device": key, "state": value["state"], "simulated": True}
+                for key, value in self.devices.items()]
+
+    def close(self):
+        pass
+
+    def execute(self, calls, expected_revision=None):
         from jsonschema import validate
         schemas = {t["function"]["name"]: t["function"]["parameters"] for t in TOOLS}
         # Validate the ENTIRE batch before any state changes.

@@ -2,6 +2,7 @@
 import time
 import sys
 import re
+from copy import deepcopy
 from .terminal import Status
 
 def progress(message):
@@ -20,6 +21,8 @@ class Gemma:
         self.device = device
         self.history = []
         self.pending = None
+        self.tools = deepcopy(TOOLS)
+        self.system = SYSTEM
         dtype = torch.float32 if device == "cpu" else torch.bfloat16
         with Status(f"Loading processor ({device})"):
             self.processor = AutoProcessor.from_pretrained(model_id)
@@ -34,6 +37,11 @@ class Gemma:
         progress(f"Model ready; footprint={self.model.get_memory_footprint()/2**30:.2f} GiB")
         if not hasattr(self.processor, "parse_response"):
             raise RuntimeError("This Transformers processor lacks parse_response; upgrade Transformers.")
+
+    def configure_home(self, context):
+        from .prompts import home_system
+        self.tools = deepcopy(context["tools"])
+        self.system = home_system(context)
 
     def reset(self):
         self.history.clear()
@@ -58,11 +66,11 @@ class Gemma:
         content = [{"type": "text", "text": text}] if text else [
             {"type": "audio", "audio": audio}]
         self.pending = {"role": "user", "content": content}
-        messages = [{"role": "system", "content": SYSTEM}] + self.history + [self.pending]
+        messages = [{"role": "system", "content": self.system}] + self.history + [self.pending]
         started = time.perf_counter()
 
         inputs = self.processor.apply_chat_template(
-            messages, tools=TOOLS, tokenize=True, return_dict=True,
+            messages, tools=self.tools, tokenize=True, return_dict=True,
             return_tensors="pt", add_generation_prompt=True,
             enable_thinking=False).to(self.device)
         # Keep token IDs integral while matching audio features to model dtype.
@@ -80,7 +88,7 @@ class Gemma:
         eos = [eos] if isinstance(eos, int) else (eos or [])
         if len(generated) >= 192 and int(generated[-1]) not in eos:
             raise ValueError("Model output reached token limit; no action executed")
-        parsed = self.processor.parse_response(raw, prefix=self.processor.decode(inputs["input_ids"][0], skip_special_tokens=False), tools=TOOLS)
+        parsed = self.processor.parse_response(raw, prefix=self.processor.decode(inputs["input_ids"][0], skip_special_tokens=False), tools=self.tools)
         return parsed, {"seconds": round(time.perf_counter()-started, 3),
                         "generated_tokens": len(generated), "device": self.device}
 

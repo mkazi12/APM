@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 import numpy as np
-from apm.voice import BLOCK, RATE, Capture, Microphone, VoiceConfig, voice_session
+from apm.voice import BLOCK, RATE, Capture, Microphone, SpeechDetector, VoiceConfig, voice_session, wait_for_command
 
 FRAME = np.full(BLOCK, 1000, dtype=np.int16)
 SILENCE = np.zeros(BLOCK, dtype=np.int16)
@@ -44,6 +44,50 @@ class VoiceTests(unittest.TestCase):
                 break
         self.assertEqual(state, 'no_speech')
         self.assertIsNone(audio)
+
+    def test_isolated_noise_votes_do_not_accumulate_into_a_command(self):
+        capture = Capture([], VoiceConfig(start_timeout=1))
+        for i in range(13):
+            state, audio = capture.feed(FRAME, i in (0, 1, 5, 6))
+        self.assertGreater(capture.speech_seconds, 0.24)
+        self.assertEqual(state, 'no_speech')
+        self.assertIsNone(audio)
+
+    def test_quiet_voiced_signal_is_captured_without_changing_audio_level(self):
+        # A quiet harmonic syllable, around 100 PCM units peak. The old mode 2
+        # rejects this whole signal; it models the quiet-command regression.
+        t = np.arange(RATE) / RATE
+        envelope = np.where(t < 0.5, np.sin(np.pi * np.minimum(2 * t, 1)) ** 2, 0)
+        voiced = (80 * (np.sin(2 * np.pi * 130 * t) + 0.4 * np.sin(2 * np.pi * 260 * t)
+                       + 0.25 * np.sin(2 * np.pi * 520 * t)) * envelope).astype(np.int16)
+        stream = np.concatenate([np.zeros(RATE, dtype=np.int16), voiced,
+                                 np.zeros(2 * RATE, dtype=np.int16)])
+        speech = SpeechDetector()
+        capture = Capture([], VoiceConfig())
+        for start in range(0, len(stream), BLOCK):
+            frame = stream[start:start + BLOCK]
+            state, audio = capture.feed(frame, speech.is_speech(frame))
+            if state != 'listening':
+                break
+        self.assertEqual(state, 'complete')
+        np.testing.assert_array_equal(audio * 32768, stream[:len(audio)])
+
+    def test_waiting_audio_primes_speech_detector_and_debug_excludes_pre_roll(self):
+        microphone = MagicMock()
+        microphone.read.side_effect = [FRAME * 10] * 2 + [SILENCE] * 13
+        detector = MagicMock()
+        detector.detect.side_effect = [False, True]
+        speech = MagicMock()
+        speech.is_speech.return_value = False
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            state, audio = wait_for_command(microphone, detector, speech,
+                                           VoiceConfig(start_timeout=1), debug=True)
+        self.assertEqual(state, 'no_speech')
+        self.assertIsNone(audio)
+        self.assertEqual(speech.is_speech.call_count, 15)
+        self.assertIn('"input_peak": 0.0', out.getvalue())
+        self.assertIn('"speech_seconds": 0.0', out.getvalue())
 
     def test_overlong_command_is_discarded_not_truncated(self):
         capture = Capture([FRAME], VoiceConfig(max_seconds=0.4))

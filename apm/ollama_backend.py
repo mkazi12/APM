@@ -72,6 +72,13 @@ class OllamaBackend:
         self.turns = []
         self.pending = None
         self.capabilities = set()
+        self.tools = deepcopy(TOOLS)
+        self.system = SYSTEM
+
+    def configure_home(self, context):
+        from .prompts import home_system
+        self.tools = deepcopy(context["tools"])
+        self.system = home_system(context)
 
     def prepare(self):
         info = self.transport.request("/api/show", {"model": self.model_id})
@@ -103,7 +110,7 @@ class OllamaBackend:
             # including WAV. This passes the audio to Gemma's audio encoder.
             user["images"] = [encode_audio(audio)]
         self.pending = user
-        messages = [{"role": "system", "content": SYSTEM}]
+        messages = [{"role": "system", "content": self.system}]
         messages.extend(message for turn in self.turns for message in turn)
         messages.append(user)
         response = {"role": "assistant", "content": ""}
@@ -112,7 +119,7 @@ class OllamaBackend:
         first_text = None
         try:
             for item in self.transport.stream("/api/chat", {
-                "model": self.model_id, "messages": messages, "tools": TOOLS,
+                "model": self.model_id, "messages": messages, "tools": self.tools,
                 "stream": True, "think": False, "keep_alive": self.keep_alive,
                 "options": {"num_ctx": self.context, "num_predict": 256, "temperature": 0}}):
                 message = item.get("message", {})
@@ -134,7 +141,7 @@ class OllamaBackend:
             if final.get("done_reason") == "length":
                 raise OllamaError("Model reached its output limit; no action executed")
             if calls:
-                # Model syntax is normalized, then SimulatedHome validates ALL
+                # The home controller validates ALL
                 # function names and arguments before dispatching any action.
                 response["tool_calls"] = calls
             if not calls and not response["content"].strip():
