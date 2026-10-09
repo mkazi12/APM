@@ -77,6 +77,16 @@ class MusicPlaybackError(RuntimeError):
         }[self.reason]
         return detail + " The request was not retried."
 
+    def pause_message(self):
+        """Control-specific guidance must never recommend starting playback."""
+        return {
+            "authorization_lost": "Apple Music authorization was lost. Reconnect its player page; pause could not be confirmed.",
+            "timeout": "Apple Music did not confirm pause before the request expired.",
+            "expired": "The music pause request expired before it could finish.",
+            "cancelled": "The music pause request was interrupted.",
+            "media_error": "Apple Music reported a media error; pause could not be confirmed.",
+        }.get(self.reason, "Music pause could not be confirmed.")
+
 
 class MusicPauseError(RuntimeError):
     """Playback control needs user intervention; only safe reason codes are exposed."""
@@ -380,6 +390,9 @@ class MusicService:
         except MusicUnavailable:
             return self._result("unavailable", reason="disconnected", **fields,
                                 message="The music player is disconnected. Reconnect its browser tab.")
+        except MusicPlaybackError as exc:
+            return self._result("unknown", reason=exc.reason, accepted=None, playing=None, was_playing=None,
+                                message=exc.pause_message())
         except Exception:
             return self._result("unknown", accepted=None, playing=None, was_playing=None,
                                 message="Music pause could not be confirmed.")

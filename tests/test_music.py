@@ -37,6 +37,20 @@ class Provider:
 
 
 class MusicTests(unittest.TestCase):
+    def test_pause_preserves_safe_browser_failure_reason_without_start_playback_advice(self):
+        for reason in MusicPlaybackError.REASONS:
+            with self.subTest(reason=reason):
+                provider = Provider()
+                provider.pause = Mock(side_effect=MusicPlaybackError(reason))
+                result = MusicService(provider).pause()
+                self.assertEqual((result["status"], result["reason"]), ("unknown", reason))
+                self.assertIsNone(result["accepted"])
+                self.assertIsNone(result["playing"])
+                self.assertIn("pause", result["message"])
+                self.assertNotIn("Start playback", result["message"])
+                provider.pause.assert_called_once_with()
+                self.assertEqual(provider.plays, [])
+
     def test_browser_failure_reason_is_preserved_without_claiming_success_or_retrying(self):
         for reason in MusicPlaybackError.REASONS:
             provider = Provider(result=MusicPlaybackError(reason))

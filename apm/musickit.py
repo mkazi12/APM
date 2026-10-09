@@ -109,6 +109,7 @@ class _Command:
     track_id: str | None
     deadline: float
     real_deadline: float
+    started_at: float
     operation: str = "play"
     dispatched: bool = False
     result: PlaybackResult | None = None
@@ -138,6 +139,7 @@ class MusicKitProvider:
         self._pending = OrderedDict()
         self._known_tracks = OrderedDict()
         self._last_command = None
+        self._last_expired_id = None
 
     def _now(self):
         value = self._now_source()
@@ -151,6 +153,7 @@ class MusicKitProvider:
         self._pending.clear()
         self._known_tracks.clear()
         self._last_command = None
+        self._last_expired_id = None
         self._session = self._storefront = self._protocol_version = None
         self._condition.notify_all()
 
@@ -161,6 +164,14 @@ class MusicKitProvider:
         for identifier, command in list(self._pending.items()):
             if now >= command.deadline or real_now >= command.real_deadline:
                 command.error = "Music playback timed out and was not retried"
+                command.error_reason = "timeout"
+                self._last_command = {
+                    "operation": command.operation, "source": "bridge",
+                    "phase": "completion" if command.dispatched else "delivery",
+                    "reason": "timeout", "elapsed_ms": min(60000, max(0, int((real_now - command.started_at) * 1000))),
+                    "dispatched": command.dispatched, "late_completion": False,
+                }
+                self._last_expired_id = command.id
                 self._pending.pop(identifier)
                 self._condition.notify_all()
         for identifier, expires in list(self._known_tracks.items()):
@@ -330,8 +341,9 @@ class MusicKitProvider:
                 self._condition.notify_all()
             if len(self._pending) >= MAX_PENDING:
                 raise RuntimeError("Apple Music playback queue is busy")
+            started_at = time.monotonic()
             command = _Command(str(uuid.uuid4()), track_id, now + timeout,
-                               time.monotonic() + timeout, operation=operation)
+                               started_at + timeout, started_at, operation=operation)
             self._pending[command.id] = command
             self._condition.notify_all()
             while command.result is None and command.error is None:
@@ -393,6 +405,11 @@ class MusicKitProvider:
             self._active(session_id, self._now())
             command = self._pending.get(command_id)
             if command is None or not command.dispatched:
+                if (command_id == self._last_expired_id and self._last_command is not None
+                        and self._last_command.get("dispatched") is True):
+                    # A late response is evidence of delivery only. Its result
+                    # and browser diagnostics cannot revive an expired write.
+                    self._last_command["late_completion"] = True
                 raise ValueError("MusicKit command is unknown, expired, or was not dispatched")
             if not error and command.operation in {"play", "resume"} and "was_playing" in result:
                 raise ValueError("Invalid play result")
@@ -401,6 +418,7 @@ class MusicKitProvider:
             # catalog metadata, arbitrary SDK messages, or stale-session data.
             self._last_command = ({"operation": command.operation, **diagnostics}
                                   if diagnostics is not None else None)
+            self._last_expired_id = None
             if error:
                 command.error = "Music browser could not confirm playback; the request was not retried"
                 if diagnostics is not None:

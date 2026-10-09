@@ -3,6 +3,7 @@ from unittest.mock import patch
 from urllib.error import HTTPError, URLError
 
 from apm.music_connection import RemoteMusicService
+from apm.music import MusicPlaybackError
 
 
 class PauseDiagnosticsTests(unittest.TestCase):
@@ -44,6 +45,19 @@ class PauseDiagnosticsTests(unittest.TestCase):
             result = self.music.pause()
         self.assertEqual(result["reason"], "pause_unconfirmed")
         self.assertNotIn("private", str(result))
+
+    def test_allowlisted_pause_failure_reason_survives_without_private_message_or_retry(self):
+        for reason in MusicPlaybackError.REASONS:
+            with self.subTest(reason=reason), patch.object(self.music, "_call", return_value={
+                "status":"unknown", "reason":reason, "accepted":None, "playing":None,
+                "message":"private-provider-token",
+            }) as request:
+                result = self.music.pause()
+                self.assertEqual((result["status"], result["reason"]), ("unknown", reason))
+                self.assertIsNone(result["playing"])
+                self.assertNotIn("private", str(result))
+                self.assertNotIn("Start playback", result["message"])
+                request.assert_called_once_with("/v1/music/pause", {}, timeout=2)
 
 
 class ResumeConnectionTests(unittest.TestCase):

@@ -87,6 +87,10 @@ class RemoteMusicService(MusicService):
             if status == "unknown" and result.get("reason") == "player_update_required":
                 reason = "player_update_required"
                 message = "Reload and reconnect the Apple Music player to enable pause."
+            elif (status == "unknown" and isinstance(result.get("reason"), str)
+                  and result["reason"] in MusicPlaybackError.REASONS):
+                reason = result["reason"]
+                message = MusicPlaybackError(reason).pause_message()
         except HTTPError as exc:
             if exc.code in {401, 403}:
                 reason = "bridge_authorization_failed"

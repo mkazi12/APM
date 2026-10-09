@@ -97,7 +97,7 @@ async function scenario(options = {}) {
     get currentItem() { return this.items[this.position]; } };
   const music = {
     isAuthorized: false, storefrontId: options.invalidRegion ? "private-region-value" : "us", playbackMode: 0,
-    playbackState: options.sequencePlaying ? 2 : resumeFixture ? 3 : options.pauseCommand ? (options.pauseIdle ? 3 : options.pauseLoading ? 1 : 2) : 0,
+    playbackState: options.sequencePlaying ? 2 : resumeFixture ? 3 : options.pauseCommand ? (options.pauseCompleted ? 10 : options.pauseStateUnknown ? 99 : options.pauseIdle ? 3 : options.pauseLoading ? 1 : 2) : 0,
     nowPlayingItem: resumeFixture ? (options.resumeStale ? mediaItem(options.resumeInvalidID ? "i.library" : "999") : initialQueue.currentItem) : null,
     queue: options.resumeAbsent ? null : initialQueue,
     currentPlaybackTime: 47.25,
@@ -239,7 +239,7 @@ async function scenario(options = {}) {
     }
     if (url.startsWith("/v1/player/commands?")) {
       if (options.commands && dispatched < options.commands.length) {
-        const { deliveryDelay = 0, afterResult, ...command } = options.commands[dispatched++];
+        const { deliveryDelay = 0, afterResult, manualPause, ...command } = options.commands[dispatched++];
         if (afterResult) {
           const until = performance.now() + 1500;
           while (!calls.some((call) => call.url.endsWith(`/${afterResult}/result`))) {
@@ -248,6 +248,11 @@ async function scenario(options = {}) {
           }
         }
         if (deliveryDelay) await sleep(deliveryDelay);
+        if (manualPause) {
+          get("pause-playback").listeners.click[0]();
+          await sleep(10);
+          assert.equal(music.playbackState, 3, "The manual pause must be observed before the wake command");
+        }
         if (options.race === "manual_start" && command.operation === "pause") {
           music.playbackState = 3;
           emit(sdkEvents, "playbackStateDidChange", { state: 3 });
@@ -258,6 +263,7 @@ async function scenario(options = {}) {
       if ((options.pauseCommand && dispatched === 0) || ((options.pauseAfterPlay || options.pauseAfterResume) && dispatched === 1)) {
         dispatched += 1;
         if (options.pauseAfterPlay || options.pauseAfterResume) await sleep(5);
+        if (options.pauseAuthLostSilently) music.isAuthorized = false;
         return response({ command: { id: "pause-command", operation: "pause",
           expires_in_ms: options.pauseShort ? 260 : options.pauseExpired ? 0 : 1500 } });
       }
@@ -432,6 +438,21 @@ async function scenario(options = {}) {
       assert.equal(outcomes.last.diagnostics.phase, "waiting");
       assert.equal(plays, 1);
       assert.equal(music.playbackState, 3);
+    } else if (options.controlSequence === "manual_paused_wake") {
+      assert.equal(acknowledgements.length, 2);
+      assert.deepEqual(outcomes.last.result, { accepted: true, playing: false, track_id: null, was_playing: false });
+      assert.equal(outcomes.last.diagnostics.reason, "confirmed");
+      assert.equal(outcomes.last.diagnostics.state, "paused");
+      assert.equal(plays, 1);
+      assert.equal(pauses, 1, "An already quiet wake must not invoke another native pause");
+    } else if (options.controlSequence === "manual_paused_pending_start") {
+      assert.equal(acknowledgements.length, 2);
+      assert.deepEqual(outcomes.last.result, { error: "playback_unconfirmed" });
+      assert.equal(outcomes.last.diagnostics.reason, "timeout");
+      assert.equal(outcomes.last.diagnostics.state, "paused");
+      assert.equal(plays, 1);
+      assert.equal(pauses, 1);
+      assert.ok(settlePlay, "This failure needs a still-unresolved native play, not merely a manual pause");
     } else if (options.controlSequence === "coalesced_pause") {
       assert.equal(acknowledgements.length, 2);
       assert.equal(outcomes.first.result.playing, false);
@@ -439,6 +460,7 @@ async function scenario(options = {}) {
       assert.equal(pauses, 1, "Concurrent pauses must share one native invocation");
       assert.equal(plays, 0);
     }
+    if (settlePlay) { settlePlay.reject(new Error("private-sdk-detail")); await sleep(0); }
     emit(events, "pagehide", {});
     return;
   }
@@ -510,6 +532,23 @@ async function scenario(options = {}) {
     assert.equal(acknowledgements.length, 1, "A preempted play must not acknowledge after the pause");
     assert.ok(acknowledgements[0].url.includes("pause-command"));
     const result = JSON.parse(acknowledgements[0].init.body).result;
+    if (options.pauseAuthLostSilently) {
+      const quietBefore = options.pauseIdle || options.pauseCompleted;
+      const cannotConfirm = options.pauseNoEffect || options.pauseReject || options.deferredPlay;
+      if (cannotConfirm) {
+        assert.deepEqual(result, { error: "playback_unconfirmed" });
+        assert.equal(JSON.parse(acknowledgements[0].init.body).diagnostics.reason, "authorization_lost");
+      } else {
+        assert.deepEqual(result, { accepted: true, playing: false, track_id: null, was_playing: !quietBefore });
+        assert.equal(JSON.parse(acknowledgements[0].init.body).diagnostics.reason, "confirmed");
+      }
+      if (quietBefore) assert.equal(pauses, 0, "Known silence needs no native call or Apple authorization");
+      else assert.ok(pauses >= 1, "Active or unknown media still needs an attempted and observed pause");
+      assert.equal(plays, options.pauseAfterPlay ? 1 : 0);
+      if (settlePlay) { settlePlay.reject(new Error("private-sdk-detail")); await sleep(0); }
+      emit(events, "pagehide", {});
+      return;
+    }
     const unconfirmed = (!options.pauseIdle && (options.pauseReject || options.pauseThrow || options.pauseNoEffect)) || options.pauseExpired || options.deferredPlay;
     if (unconfirmed) assert.deepEqual(result, { error: "playback_unconfirmed" });
     else assert.deepEqual(result, { accepted: true, playing: false, track_id: null,
@@ -583,6 +622,18 @@ async function scenario(options = {}) {
     { pauseCommand: true, expectedPlaybackDiagnostic: { phase: "confirm", reason: "confirmed", state: "paused" } }, { pauseCommand: true, pauseIdle: true },
     { pauseCommand: true, pauseIdle: true, pauseThrow: true },
     { pauseCommand: true, pauseIdle: true, pauseReject: true },
+    { pauseCommand: true, pauseIdle: true, pauseAuthLostSilently: true,
+      expectedPlaybackDiagnostic: { phase: "confirm", reason: "confirmed", state: "paused" } },
+    { pauseCommand: true, pauseCompleted: true, pauseAuthLostSilently: true,
+      expectedPlaybackDiagnostic: { phase: "confirm", reason: "confirmed", state: "completed" } },
+    { pauseCommand: true, pauseAuthLostSilently: true,
+      expectedPlaybackDiagnostic: { phase: "confirm", reason: "confirmed", state: "paused" } },
+    { pauseCommand: true, pauseNoEffect: true, pauseShort: true, pauseAuthLostSilently: true,
+      expectedPlaybackDiagnostic: { phase: "confirm", reason: "authorization_lost", state: "playing" } },
+    { pauseCommand: true, pauseStateUnknown: true, pauseNoEffect: true, pauseShort: true, pauseAuthLostSilently: true,
+      expectedPlaybackDiagnostic: { phase: "confirm", reason: "authorization_lost", state: "unknown" } },
+    { pauseAfterPlay: true, deferredPlay: true, playEventDelay: 90, pauseShort: true, pauseAuthLostSilently: true,
+      expectedPlaybackDiagnostic: { phase: "confirm", reason: "authorization_lost" } },
     { pauseCommand: true, pauseThrow: true },
     { pauseCommand: true, pauseLoading: true }, { pauseCommand: true, pauseReject: true },
     { pauseCommand: true, pauseNoEffect: true, pauseShort: true }, { pauseCommand: true, pauseExpired: true },
@@ -647,6 +698,14 @@ async function scenario(options = {}) {
       { id: "first", operation: "resume", expires_in_ms: 20000 },
       { id: "middle", operation: "pause", expires_in_ms: 1500, afterResult: "first" },
       { id: "last", operation: "resume", expires_in_ms: 1550, afterResult: "middle" },
+    ] },
+    { controlSequence: "manual_paused_wake", commands: [
+      { id: "first", operation: "resume", expires_in_ms: 20000 },
+      { id: "last", operation: "pause", expires_in_ms: 1500, afterResult: "first", manualPause: true },
+    ] },
+    { controlSequence: "manual_paused_pending_start", deferredPlay: true, commands: [
+      { id: "first", operation: "resume", expires_in_ms: 20000 },
+      { id: "last", operation: "pause", expires_in_ms: 260, afterResult: "first", manualPause: true },
     ] },
     { controlSequence: "coalesced_pause", sequencePlaying: true, pauseDelay: 80, commands: [
       { id: "first", operation: "pause", expires_in_ms: 1500 },

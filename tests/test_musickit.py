@@ -138,7 +138,56 @@ class MusicKitTests(unittest.TestCase):
         result = MusicService(provider).pause()
         self.assertLess(time.monotonic() - started, 0.5)
         self.assertEqual(result["status"], "unknown")
+        self.assertEqual(result["reason"], "timeout")
         self.assertIsNone(provider.poll(session, wait_seconds=0))
+        detail = provider.status()["last_command"]
+        self.assertEqual({key: detail[key] for key in ("operation", "source", "phase", "reason", "dispatched", "late_completion")},
+                         {"operation":"pause", "source":"bridge", "phase":"delivery", "reason":"timeout",
+                          "dispatched":False, "late_completion":False})
+        self.assertGreaterEqual(detail["elapsed_ms"], 20)
+
+    def test_dispatched_pause_timeout_records_late_delivery_without_reviving_result(self):
+        clock = [100.0]
+        provider, session, _ = self.provider(clock=clock)
+        worker, result, errors = self.start_operation(lambda: MusicService(provider).pause(), provider)
+        command = self.command(provider, session)
+        clock[0] += 2
+        detail = provider.status()["last_command"]
+        worker.join(1)
+        self.assertEqual(errors, [])
+        self.assertEqual(result[0]["reason"], "timeout")
+        self.assertIsNone(result[0]["playing"])
+        self.assertEqual((detail["phase"], detail["dispatched"], detail["late_completion"]), ("completion", True, False))
+        with self.assertRaises(ValueError):
+            provider.complete(session, str(uuid.uuid4()), {"accepted":True,"playing":False})
+        self.assertEqual(provider.status()["last_command"], detail)
+        with self.assertRaises(ValueError):
+            provider.complete(session, command["id"], {"accepted":True,"playing":False},
+                              diagnostics=diagnostics(state="paused"))
+        self.assertEqual(provider.status()["last_command"], {**detail, "late_completion":True})
+        self.assertNotIn(command["id"], str(provider.status()))
+        self.assertNotIn(session, str(provider.status()))
+        self.assertEqual(result[0]["reason"], "timeout")
+        provider.activate(str(uuid.uuid4()), "us")
+        self.assertNotIn("last_command", provider.status())
+
+    def test_previous_expired_command_cannot_modify_newer_completion_diagnostics(self):
+        clock = [100.0]
+        provider, session, _ = self.provider(clock=clock)
+        worker, _, _ = self.start_operation(provider.pause, provider)
+        expired = self.command(provider, session)
+        clock[0] += 2
+        self.assertEqual(provider.status()["last_command"]["reason"], "timeout")
+        worker.join(1)
+        worker, _, errors = self.start_operation(provider.pause, provider)
+        current = self.command(provider, session)
+        detail = diagnostics(state="paused")
+        provider.complete(session, current["id"], {"accepted":True,"playing":False}, diagnostics=detail)
+        worker.join(1)
+        self.assertEqual(errors, [])
+        with self.assertRaises(ValueError):
+            provider.complete(session, expired["id"], {"accepted":True,"playing":False})
+        self.assertEqual(provider.status()["last_command"], {"operation":"pause", **detail})
 
     def test_resume_uses_current_browser_queue_without_catalog_search(self):
         for response, expected in (
@@ -195,7 +244,7 @@ class MusicKitTests(unittest.TestCase):
 
     def test_resume_timeout_disconnect_and_errors_do_not_retry(self):
         provider, session, transport = self.provider(clock=[100], timeout=0.02)
-        with self.assertRaisesRegex(RuntimeError, "timed out"):
+        with self.assertRaisesRegex(MusicPlaybackError, "timeout"):
             provider.resume()
         self.assertIsNone(provider.poll(session, wait_seconds=0))
         self.assertEqual(transport.calls, [])
@@ -470,7 +519,9 @@ class MusicKitTests(unittest.TestCase):
         worker.join(1)
         self.assertEqual(result, [])
         self.assertEqual(len(errors), 1)
-        self.assertNotIn("last_command", provider.status())
+        self.assertEqual(provider.status()["last_command"]["source"], "bridge")
+        self.assertEqual(provider.status()["last_command"]["phase"], "completion")
+        self.assertTrue(provider.status()["last_command"]["late_completion"])
 
     def test_diagnostic_validator_accepts_boundaries_without_retaining_extra_data(self):
         for detail in (diagnostics(elapsed_ms=0, phase_ms=0),
@@ -481,7 +532,7 @@ class MusicKitTests(unittest.TestCase):
         provider, session, _ = self.provider(clock=[100.0], timeout=0.02)
         provider.search("A Ballad")
         started = time.monotonic()
-        with self.assertRaisesRegex(RuntimeError, "timed out"):
+        with self.assertRaisesRegex(MusicPlaybackError, "timeout"):
             provider.play("123456789")
         self.assertLess(time.monotonic() - started, 0.5)
         self.assertIsNone(provider.poll(session, wait_seconds=0))

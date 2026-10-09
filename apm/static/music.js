@@ -117,8 +117,8 @@
     } catch (_) { /* A diagnostic display must not prevent acknowledgment. */ }
     return snapshot;
   }
-  function playbackCurrentFailure(current, deadline, initial = false) {
-    if (!authorized()) return new PlaybackFailure("authorization_lost");
+  function playbackCurrentFailure(current, deadline, initial = false, requireAuthorization = true) {
+    if (requireAuthorization && !authorized()) return new PlaybackFailure("authorization_lost");
     if (!current()) return new PlaybackFailure("cancelled");
     if (!Number.isFinite(deadline) || performance.now() >= deadline) return new PlaybackFailure(initial ? "expired" : "timeout");
     return null;
@@ -634,11 +634,12 @@
     };
     const run = () => {
       const now = performance.now();
-      const active = batch.requests.filter((entry) => {
-        try { return entry.current() && Number.isFinite(entry.deadline) && now < entry.deadline; }
+      const currentRequests = batch.requests.filter((entry) => {
+        try { return entry.current(); }
         catch (_) { return false; }
       });
-      if (!active.length) return finish(new PlaybackFailure("cancelled"));
+      const active = currentRequests.filter((entry) => Number.isFinite(entry.deadline) && now < entry.deadline);
+      if (!active.length) return finish(new PlaybackFailure(currentRequests.length ? "timeout" : "cancelled"));
       if (state.music === music && pauseActivity() === false && !state.pendingStarts.size) return finish();
       const remaining = state.lastSDKPause + sdkControlWindow - Date.now();
       if (remaining > 0) {
@@ -695,7 +696,7 @@
         for (const [name, callback] of [["playbackStateDidChange", check], ["mediaPlaybackError", mediaFailed]]) {
           try { music.removeEventListener(name, callback); } catch (_) { /* Still settle. */ }
         }
-        if (error) { playbackFailure(trace, error); reject(error); }
+        if (error) { pauseFailure(trace, error); reject(error); }
         else { trace.reason = "confirmed"; resolve({ accepted: true, playing: false, track_id: null, was_playing: wasPlaying }); }
       };
       const failed = (error) => finish(error || new PlaybackFailure("unknown"));
@@ -703,13 +704,13 @@
       const check = () => {
         if (settled) return;
         try {
-          const error = playbackCurrentFailure(current, deadline);
+          const error = playbackCurrentFailure(current, deadline, false, false);
           if (error) return failed(error);
           if (pauseActivity() === false && state.pendingStarts.size === 0) finish();
         } catch (error) { failed(error); }
       };
       try {
-        const error = playbackCurrentFailure(current, deadline);
+        const error = playbackCurrentFailure(current, deadline, false, false);
         if (error) return failed(error);
         music.addEventListener("playbackStateDidChange", check);
         music.addEventListener("mediaPlaybackError", mediaFailed);
@@ -725,17 +726,29 @@
     });
   }
 
+  function pauseFailure(trace, error) {
+    playbackFailure(trace, error);
+    if (!authorized() && !["cancelled", "expired"].includes(trace.reason)) trace.reason = "authorization_lost";
+  }
+
   async function executePause(command, sessionId, generation, wasPlaying, deadline, trace) {
-    const current = () => state.sessionId === sessionId && state.generation === generation && authorized();
+    const music = state.music;
+    const currentSession = () => state.sessionId === sessionId && state.generation === generation;
+    // Public MusicKit.pause controls local media and does not validate Apple
+    // authorization. A completed/paused player can remain quiet after sign-in
+    // expires; starting music still requires authorization in the play path.
+    const current = () => currentSession() && state.music === music;
     let outcome = { error: "playback_unconfirmed" };
     try {
-      const error = playbackCurrentFailure(current, deadline, true);
+      const error = playbackCurrentFailure(current, deadline, true, false);
       if (error) throw error;
       playbackPhase(trace, "confirm");
       outcome = await pauseAndConfirm(current, deadline, wasPlaying, trace);
-    } catch (error) { playbackFailure(trace, error); }
+    } catch (error) { pauseFailure(trace, error); }
     const diagnostics = playbackSnapshot(trace);
-    if (!current()) return;
+    // Authorization can age out without an SDK event. The same local bridge
+    // still needs the failure result instead of waiting for its own timeout.
+    if (!currentSession()) return;
     try {
       await api(`/v1/player/commands/${encodeURIComponent(command.id)}/result`, {
         method: "POST", body: { session_id: sessionId, result: outcome, diagnostics }, timeout: 300,

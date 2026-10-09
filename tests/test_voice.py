@@ -158,6 +158,8 @@ class VoiceTests(unittest.TestCase):
 
     def test_known_pause_failures_propagate_fixed_recovery_without_capturing(self):
         recovery = {
+            'authorization_lost': 'authorization ended and the player could not confirm it stopped',
+            'timeout': 'music player did not confirm pause in time',
             'player_update_required': 'player tab is outdated',
             'bridge_authorization_failed': 'connection to the local music server was rejected',
             'bridge_update_required': 'music server does not support pause',

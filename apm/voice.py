@@ -269,6 +269,12 @@ def _wait_for_quiet(microphone, speech):
 
 
 _PAUSE_FAILURE_MESSAGES = {
+    "authorization_lost": (
+        "Apple Music authorization ended and the player could not confirm it stopped. "
+        "Open its player tab and reconnect Apple Music."),
+    "timeout": (
+        "The music player did not confirm pause in time. Bring its browser tab forward "
+        "and check its playback diagnostics."),
     "player_update_required": (
         "The Apple Music player tab is outdated. Refresh the browser page (Cmd-R on Mac), "
         "then reconnect Apple Music. The 'Reload setup' button does not refresh the page; "
