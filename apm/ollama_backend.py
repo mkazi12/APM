@@ -64,7 +64,7 @@ def encode_audio(audio):
 
 class OllamaBackend:
     def __init__(self, model_id="gemma4:e2b", host="http://127.0.0.1:11434",
-                 keep_alive="10m", context=4096, transport=None):
+                 keep_alive="10m", context=8192, transport=None):
         self.model_id = model_id
         self.transport = transport or Transport(host)
         self.keep_alive = keep_alive
@@ -74,20 +74,33 @@ class OllamaBackend:
         self.capabilities = set()
         self.tools = deepcopy(TOOLS)
         self.system = SYSTEM
+        self.current_context = None
 
     def configure_home(self, context):
-        from .prompts import home_system
+        from .prompts import home_prompt_parts
         self.tools = deepcopy(context["tools"])
-        self.system = home_system(context)
+        self.system, self.current_context = home_prompt_parts(context)
 
-    def prepare(self):
+    def prepare(self, *, audio=False):
         info = self.transport.request("/api/show", {"model": self.model_id})
         self.capabilities = set(info.get("capabilities", []))
         if "tools" not in self.capabilities:
             raise OllamaError(f"{self.model_id} does not advertise tool calling. Use gemma4:e2b.")
-        # Execute one token so 'Ready' follows actual inference, not just loading.
+        if audio and "audio" not in self.capabilities:
+            raise OllamaError(f"{self.model_id} does not advertise native audio support. Update Ollama or use --backend transformers.")
+        # Warm the actual stable prompt and tools, not an unrelated greeting.
+        # The response is discarded without dispatching calls or changing history.
+        messages = [{"role": "system", "content": self.system}]
+        if self.current_context is not None:
+            messages.append({"role": "system", "content": self.current_context})
+        user = {"role": "user", "content": "Hello"}
+        if audio:
+            # Fileless silence initializes the audio encoder without accessing
+            # a microphone or sending any past personal recording.
+            user["images"] = [encode_audio([0.0] * 16000)]
+        messages.append(user)
         reply = self.transport.request("/api/chat", {
-            "model": self.model_id, "messages": [{"role": "user", "content": "Hello"}],
+            "model": self.model_id, "messages": messages, "tools": self.tools,
             "stream": False, "think": False, "keep_alive": self.keep_alive,
             "options": {"num_ctx": self.context, "num_predict": 1, "temperature": 0}})
         if not reply.get("done"):
@@ -112,6 +125,10 @@ class OllamaBackend:
         self.pending = user
         messages = [{"role": "system", "content": self.system}]
         messages.extend(message for turn in self.turns for message in turn)
+        if self.current_context is not None:
+            # Fresh state is supplied only for this request, never committed as
+            # stale conversation history or inserted ahead of the stable prefix.
+            messages.append({"role": "system", "content": self.current_context})
         messages.append(user)
         response = {"role": "assistant", "content": ""}
         calls = []

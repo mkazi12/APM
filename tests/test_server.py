@@ -97,7 +97,10 @@ class ServerTests(unittest.TestCase):
         result = self.client.post("/v1/devices/kitchen/commands", json={"state": "on"})
         self.assertEqual(result.json(), {"device": "kitchen", "state": "on", "accepted": True})
         self.assertEqual(self.home.calls[-1], ("command", "kitchen", "on"))
-        self.assertEqual(self.client.get("/v1/context").json(), {"devices": [], "tools": []})
+        context = self.client.get("/v1/context").json()
+        self.assertEqual(context["devices"], [])
+        self.assertFalse(context["music"]["configured"])
+        self.assertIn("play_music", [item["function"]["name"] for item in context["tools"]])
         result = self.client.delete("/v1/devices/kitchen")
         self.assertEqual((result.status_code, result.content), (204, b""))
         self.assertEqual(self.home.calls[-1], ("remove_device", "kitchen"))
@@ -237,13 +240,15 @@ class ServerTests(unittest.TestCase):
                 self.assertNotIn("desk", json.loads(path.read_text())["devices"])
 
     def test_cli_only_binds_loopback_and_disables_proxy_headers(self):
-        with patch("apm.home.load_home", return_value=self.home) as load, patch("uvicorn.run") as run:
+        with patch("apm.home.load_home", return_value=self.home) as load, patch("uvicorn.run") as run, \
+                patch("apm.tasks.TaskService"), patch("apm.scheduler.Scheduler"):
             self.assertEqual(main(["--registry", "config/test-home.json", "--port", "9000"]), 0)
         load.assert_called_once_with(Path("config/test-home.json"))
         self.assertEqual(run.call_args.kwargs, {"host": "127.0.0.1", "port": 9000, "proxy_headers": False, "access_log": False})
 
     def test_cli_init_is_explicit_and_does_not_overwrite_registry(self):
-        with patch("apm.home.initialize_home") as initialize, patch("apm.home.load_home", return_value=self.home), patch("uvicorn.run"):
+        with patch("apm.home.initialize_home") as initialize, patch("apm.home.load_home", return_value=self.home), patch("uvicorn.run"), \
+                patch("apm.tasks.TaskService"), patch("apm.scheduler.Scheduler"):
             self.assertEqual(main(["--init", "--registry", "config/test-home.json"]), 0)
         initialize.assert_called_once_with(Path("config/test-home.json"))
         with patch("apm.home.initialize_home", side_effect=FileExistsError("private-secret")), patch("uvicorn.run") as run, patch("sys.stderr"):

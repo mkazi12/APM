@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Apple Music · APM Assistant</title>
+  <style>
+    body { max-width: 640px; margin: 24px; font: 16px/1.5 system-ui, sans-serif; }
+    h1 { font-size: 1.5rem; }
+    h2 { font-size: 1.1rem; }
+    p { margin: .5rem 0; }
+    section, details { margin: 1.5rem 0; }
+    button, input { font: inherit; }
+    button { margin: 0 .25rem .25rem 0; }
+    label { display: block; margin: .75rem 0; }
+    input { display: block; box-sizing: border-box; width: 100%; max-width: 24rem; }
+    #artwork { width: 80px; height: 80px; object-fit: cover; }
+    .candidate { text-align: left; }
+    .candidate-title, .candidate-detail { display: block; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+    [hidden] { display: none !important; }
+  </style>
+  <script src="/static/music.js" defer></script>
+</head>
+<body>
+  <h1>APM · Apple Music</h1>
+  <p>Keep this tab open to play music through APM.</p>
+
+  <section id="connection" data-state="loading" aria-label="Apple Music connection">
+    <strong id="connection-title">Checking setup…</strong>
+    <p id="connection-detail" role="status" aria-live="polite">Preparing the local player.</p>
+    <button id="connect" type="button" disabled>Connect Apple Music</button>
+    <button id="reload-setup" type="button" hidden>Reload player</button>
+    <button id="disconnect" type="button" hidden>Disconnect</button>
+  </section>
+
+  <details id="auth-diagnostics" hidden>
+    <summary>Connection diagnostics</summary>
+    <p>This trace stays on this page. It excludes credentials and account details.</p>
+    <pre id="auth-diagnostics-output"></pre>
+  </details>
+
+  <main>
+    <section aria-labelledby="now-playing-heading">
+      <h2 id="now-playing-heading">Now playing</h2>
+      <span id="artwork-placeholder" aria-hidden="true"></span>
+      <img id="artwork" alt="" referrerpolicy="no-referrer" hidden>
+      <p><strong id="track-title">Choose something to play</strong></p>
+      <p id="track-artist">Your next song will appear here.</p>
+      <p id="playback-label" data-playing="false"><span id="playback-state">Not playing</span></p>
+      <div aria-label="Playback controls">
+        <button id="start-playback" type="button" disabled>Start playback</button>
+        <button id="pause-playback" type="button" disabled>Pause</button>
+      </div>
+      <p id="player-note" role="status" aria-live="polite">A browser may ask you to start playback with a click.</p>
+      <details id="playback-diagnostics" hidden>
+        <summary>Latest playback diagnostics</summary>
+        <pre id="playback-diagnostics-output"></pre>
+      </details>
+      <a id="apple-link" href="https://music.apple.com/" target="_blank" rel="noopener noreferrer">Listen on Apple Music</a>
+    </section>
+
+    <section aria-labelledby="request-heading">
+      <h2 id="request-heading">Play a song</h2>
+      <form id="song-form">
+        <label for="song-title">Song
+          <input id="song-title" name="title" maxlength="200" required autocomplete="off" disabled>
+        </label>
+        <label for="song-artist">Artist (optional)
+          <input id="song-artist" name="artist" maxlength="200" autocomplete="off" disabled>
+        </label>
+        <button id="request-song" type="submit" disabled>Play song</button>
+      </form>
+      <p id="result-message" role="status" aria-live="polite">Connect Apple Music to get started.</p>
+      <ul id="candidates" aria-label="Choose a recording" hidden></ul>
+    </section>
+  </main>
+  <footer><small>Music provided by Apple Music. Full songs require an active subscription.</small></footer>
+</body>
+</html>

@@ -1,8 +1,9 @@
 """Wake-word gated, local audio conversation. Detection runs on CPU."""
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 import json
+import math
 import queue
 import shutil
 import subprocess
@@ -16,16 +17,38 @@ from .terminal import Status
 RATE = 16000
 BLOCK = 1280  # 80 ms: openWakeWord's streaming step.
 DEFAULT_WAKE_MODEL = Path(__file__).resolve().parent.parent / "models" / "hey_gemma.onnx"
+DEFAULT_VOICE_SETTINGS = DEFAULT_WAKE_MODEL.parent.parent / "work" / "voice.json"
+
+
+def resolve_wake_model(override=None, *, settings_path=None):
+    """Use an explicit model, a saved local selection, or the bundled baseline."""
+    if override is not None:
+        return Path(override).expanduser().resolve()
+    settings = Path(settings_path) if settings_path is not None else DEFAULT_VOICE_SETTINGS
+    try:
+        saved = json.loads(settings.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return DEFAULT_WAKE_MODEL.resolve()
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"Cannot read voice settings {settings}; fix the file or use --wake-model.") from exc
+    if (not isinstance(saved, dict) or set(saved) != {"wake_model"}
+            or not isinstance(saved["wake_model"], str) or not saved["wake_model"].strip()):
+        raise ValueError(f"Invalid voice settings {settings}; expected a wake_model path or use --wake-model.")
+    model = Path(saved["wake_model"]).expanduser()
+    if not model.is_absolute():
+        model = settings.parent / model
+    return model.resolve()
 
 
 @dataclass
 class VoiceConfig:
-    wake_model: Path = DEFAULT_WAKE_MODEL
+    wake_model: Path | None = None
     threshold: float | None = None
     silence_seconds: float = 0.8
     start_timeout: float = 5.0
     max_seconds: float = 25.0
     pre_roll_seconds: float = 1.6
+    follow_up_timeout: float = 8.0
     microphone: int | None = None
     speak: bool = True
 
@@ -38,13 +61,18 @@ class VoiceConfig:
             raise ValueError("Capture durations must be positive")
         if self.max_seconds + self.pre_roll_seconds > 30:
             raise ValueError("Capture including pre-roll must fit within 30 seconds")
+        if (isinstance(self.follow_up_timeout, bool)
+                or not math.isfinite(self.follow_up_timeout)
+                or not 0 <= self.follow_up_timeout <= 15):
+            raise ValueError("Follow-up timeout must be between 0 and 15 seconds; 0 disables it")
 
 
 class WakeDetector:
     def __init__(self, config):
         from openwakeword.model import Model
         self.config = config
-        model = Path(config.wake_model).expanduser().resolve()
+        model = resolve_wake_model(config.wake_model)
+        self.model_path = model
         required = [model, model.parent / "melspectrogram.onnx", model.parent / "embedding_model.onnx"]
         for path in required:
             if not path.is_file():
@@ -75,6 +103,9 @@ class WakeDetector:
 
 class SpeechDetector:
     def __init__(self):
+        self.reset()
+
+    def reset(self):
         import webrtcvad
         # Mode 2 discards quiet commands that the wake-word model can still hear.
         # Capture requires a sustained onset to reject isolated noise votes.
@@ -89,8 +120,9 @@ class SpeechDetector:
 
 class Capture:
     """Pure endpoint state: returns audio only after post-wake speech + silence."""
-    def __init__(self, pre_roll, config):
+    def __init__(self, pre_roll, config, *, onset_seconds=0.24):
         self.config = config
+        self.onset_seconds = onset_seconds
         self.frames = list(pre_roll)
         self.pre_roll_frames = len(self.frames)
         self.elapsed = 0.0
@@ -113,7 +145,7 @@ class Capture:
             self.silence += BLOCK / RATE
         # Separate clicks/noise bursts must not add up to a spoken command.
         # Once speech has started, allow pauses inside the command as before.
-        self.has_speech = self.has_speech or self.speech_run >= 0.24
+        self.has_speech = self.has_speech or self.speech_run >= self.onset_seconds
         # Never execute a cut-off command: the user may be about to negate it.
         if self.elapsed >= self.config.max_seconds:
             return "too_long", None
@@ -224,7 +256,96 @@ class Speaker:
             raise
 
 
-def wait_for_command(microphone, detector, speech, config, debug=False):
+def _wait_for_quiet(microphone, speech):
+    # A missing prefix could contain "don't". Discard speech overlapping a
+    # transition, then require a completely new onset after the listening cue.
+    quiet_frames = 0
+    for _ in range(round(2 * RATE / BLOCK)):
+        frame = microphone.read()
+        quiet_frames = 0 if speech.is_speech(frame) else quiet_frames + 1
+        if quiet_frames >= 3:
+            return
+    raise RuntimeError("No quiet boundary; wait for the listening cue before speaking")
+
+
+_PAUSE_FAILURE_MESSAGES = {
+    "player_update_required": (
+        "The Apple Music player tab is outdated. Refresh the browser page (Cmd-R on Mac), "
+        "then reconnect Apple Music. The 'Reload setup' button does not refresh the page; "
+        "restarting APM alone does not update it."),
+    "bridge_authorization_failed": (
+        "APM's connection to the local music server was rejected. Restart APM to load the current "
+        "music connection, then reconnect the player."),
+    "bridge_update_required": (
+        "The music server does not support pause. Restart apm-music with the updated code, "
+        "then refresh the player tab and reconnect Apple Music."),
+    "bridge_unreachable": (
+        "The local music server could not be reached. Start or check apm-music, "
+        "then open its player page and reconnect Apple Music."),
+}
+
+
+class MusicPauseFailure(RuntimeError):
+    """A pause failure with a fixed, token-free recovery message for voice."""
+
+    def __init__(self, reason):
+        self.reason = reason if isinstance(reason, str) and reason in _PAUSE_FAILURE_MESSAGES else None
+        message = _PAUSE_FAILURE_MESSAGES.get(self.reason, "Music pause could not be confirmed.")
+        super().__init__(message + " Microphone stopped; returning to text. "
+                         "Fix the player connection, then type /voice.")
+
+
+def _pause_for_capture(microphone, speech, pause_music):
+    """Return whether playback audio must be dropped, or report a pause failure."""
+    if pause_music is None:
+        return False
+    try:
+        outcome = pause_music()
+    except Exception:
+        outcome = {"status": "unknown"}
+    if not isinstance(outcome, dict):
+        return None
+    if outcome.get("status") == "unavailable":
+        # APM can still listen without a configured/connected music player.
+        return False
+    if outcome.get("status") != "paused" or outcome.get("playing") is not False:
+        reason = outcome.get("reason")
+        if isinstance(reason, str) and reason in _PAUSE_FAILURE_MESSAGES:
+            # Remote messages may include credentials or arbitrary response
+            # text. Only a known reason selects our own recovery instructions.
+            raise MusicPauseFailure(reason)
+        return None
+    if outcome.get("was_playing") is False:
+        return False
+    # Keep lyrics, the room's playback tail, and input queued during pause out
+    # of Gemma's command. The listening cue follows this transition.
+    microphone.pause()
+    time.sleep(0.15)
+    speech.reset()
+    microphone.resume()
+    _wait_for_quiet(microphone, speech)
+    return True
+
+
+def _capture_command(microphone, speech, config, pre_roll=(), *, follow_up=False, debug=False):
+    # Follow-ups commonly consist of a short "yes" or "no". Two consecutive
+    # speech frames admit those while still rejecting an isolated noise frame.
+    capture = Capture(pre_roll, config, onset_seconds=0.16 if follow_up else 0.24)
+    if sys.stdout.isatty():
+        print("\a", end="", flush=True)
+    label = "Listening for your reply · no wake phrase needed" if follow_up else "Listening · speak now"
+    with Status(label):
+        while True:
+            frame = microphone.read()
+            state, audio = capture.feed(frame, speech.is_speech(frame))
+            if state != "listening":
+                break
+    if debug:
+        print("Voice capture: " + json.dumps({"state": state, "follow_up": follow_up, **capture.diagnostics()}))
+    return state, audio
+
+
+def wait_for_command(microphone, detector, speech, config, debug=False, *, pause_music=None):
     ring = deque(maxlen=round(config.pre_roll_seconds * RATE / BLOCK))
     detector.reset()
     with Status('Waiting for “Hey Gemma” · mic on'):
@@ -236,18 +357,27 @@ def wait_for_command(microphone, detector, speech, config, debug=False):
             ring.append(frame)
             if detector.detect(frame):
                 break
-    capture = Capture(ring, config)
-    if sys.stdout.isatty():
-        print("\a", end="", flush=True)
-    with Status("Listening · speak now"):
-        while True:
-            frame = microphone.read()
-            state, audio = capture.feed(frame, speech.is_speech(frame))
-            if state != "listening":
-                break
-    if debug:
-        print("Voice capture: " + json.dumps({"state": state, **capture.diagnostics()}))
-    return state, audio
+    quieted = _pause_for_capture(microphone, speech, pause_music)
+    if quieted is None:
+        return "pause_failed", None
+    if quieted:
+        ring.clear()
+    return _capture_command(microphone, speech, config, ring, debug=debug)
+
+
+def wait_for_reply(microphone, speech, config, debug=False, *, pause_music=None):
+    if config.follow_up_timeout <= 0:
+        return "no_speech", None
+    quieted = _pause_for_capture(microphone, speech, pause_music)
+    if quieted is None:
+        return "pause_failed", None
+    if not quieted:
+        # Mic input was disabled during inference/TTS. Do not execute the
+        # suffix of an answer begun before it resumed, even without music.
+        speech.reset()
+        _wait_for_quiet(microphone, speech)
+    reply_config = replace(config, start_timeout=config.follow_up_timeout)
+    return _capture_command(microphone, speech, reply_config, follow_up=True, debug=debug)
 
 
 def voice_session(model, home, request, config=None, debug=False):
@@ -260,11 +390,41 @@ def voice_session(model, home, request, config=None, debug=False):
         speech = SpeechDetector()
         speaker = Speaker(config.speak)
     print('Voice mode · say “Hey Gemma”, then your request. Ctrl-C returns to text.')
+    print('During music, wait for it to pause and the listening cue before speaking. Questions allow a reply without another wake phrase.')
+    print(f"Wake model · {detector.model_path} · threshold {detector.threshold}")
     print('Experimental wake detector: false triggers and missed wakes are possible.')
+    from .conversation import reply_needs_answer
+    pause_music = getattr(getattr(home, "music", None), "pause", None)
+    pause_music = pause_music if callable(pause_music) else None
+    follow_up = False
+    capture_failures = 0
     try:
         with Microphone(config.microphone) as microphone:
             while True:
-                state, audio = wait_for_command(microphone, detector, speech, config, debug=debug)
+                try:
+                    if follow_up:
+                        state, audio = wait_for_reply(microphone, speech, config, debug=debug, pause_music=pause_music)
+                    else:
+                        state, audio = wait_for_command(microphone, detector, speech, config,
+                                                        debug=debug, pause_music=pause_music)
+                except MusicPauseFailure as exc:
+                    microphone.pause()
+                    print(str(exc))
+                    return
+                except (RuntimeError, ValueError, OSError) as exc:
+                    microphone.pause()
+                    follow_up = False
+                    capture_failures += 1
+                    if capture_failures >= 3:
+                        raise RuntimeError("Microphone capture failed repeatedly; check the input device and restart /voice") from exc
+                    print(f"Voice capture interrupted; this turn was discarded: {exc}. Say Hey Gemma again.")
+                    time.sleep(0.35)
+                    detector.reset()
+                    speech.reset()
+                    microphone.resume()
+                    continue
+                capture_failures = 0
+                was_follow_up, follow_up = follow_up, False
                 microphone.pause()
                 if state == "complete":
                     try:
@@ -272,6 +432,9 @@ def voice_session(model, home, request, config=None, debug=False):
                     except Exception as exc:
                         print(f"Voice request failed: {exc}")
                     else:
+                        follow_up = bool(config.follow_up_timeout and
+                                         (reply.expects_reply if hasattr(reply, "expects_reply")
+                                          else reply_needs_answer(reply)))
                         if config.speak and reply:
                             try:
                                 with Status("Speaking · mic paused"):
@@ -280,6 +443,15 @@ def voice_session(model, home, request, config=None, debug=False):
                                 print(f"Reply was completed, but speech playback failed: {exc}")
                 elif state == "too_long":
                     print("Command was too long and was discarded. Please try a shorter request.")
+                elif state == "pause_failed":
+                    print("Music pause could not be confirmed. Microphone stopped; returning to text. "
+                          "Pause the player, reload its page and reconnect Apple Music, then type /voice.")
+                    # Do not re-arm on lyrics or another wake while the same
+                    # broken player still cannot confirm silence. Exiting the
+                    # microphone context closes capture and preserves chat.
+                    return
+                elif was_follow_up:
+                    print("No reply heard. Waiting for the wake phrase again.")
                 else:
                     print("No command heard. Waiting for the wake phrase again.")
                 # Discard playback tail and any audio received during inference.
@@ -287,4 +459,4 @@ def voice_session(model, home, request, config=None, debug=False):
                 detector.reset()
                 microphone.resume()
     except KeyboardInterrupt:
-        print("\nMicrophone stopped. Returning to text.")
+        print("\nVoice mode interrupted (Ctrl-C/SIGINT). Microphone stopped; type /voice to listen again.")

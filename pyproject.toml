@@ -11,6 +11,7 @@ dependencies = ["jsonschema>=4.23", "soundfile>=0.13", "librosa>=0.11", "soundde
 
 [project.optional-dependencies]
 home = ["fastapi>=0.115,<1", "uvicorn>=0.30,<1", "websocket-client>=1.8,<2"]
+apple-music = ["fastapi>=0.115,<1", "uvicorn>=0.30,<1", "PyJWT[crypto]>=2.9,<3"]
 wake-training = ["onnx>=1.16", "scikit-learn>=1.7"]
 transformers = ["torch>=2.6", "kernels>=0.12; sys_platform == 'darwin'", "torchvision>=0.21", "pillow>=11", "transformers>=5.18,<6", "accelerate>=1"]
 
@@ -18,6 +19,10 @@ transformers = ["torch>=2.6", "kernels>=0.12; sys_platform == 'darwin'", "torchv
 [project.scripts]
 apm = "apm.cli:main"
 apm-server = "apm.server:main"
+apm-music = "apm.apple_music_server:main"
 
 [tool.setuptools.packages.find]
 include = ["apm*"]
+
+[tool.setuptools.package-data]
+apm = ["static/*.html", "static/*.js"]

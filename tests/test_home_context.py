@@ -71,6 +71,12 @@ class HomeContextTests(unittest.TestCase):
     def catalog(system):
         return json.loads(system.split("Device catalog (JSON):\n", 1)[1])
 
+    @classmethod
+    def ollama_catalog(cls, payload):
+        return cls.catalog(next(message["content"] for message in payload["messages"]
+                                if message["role"] == "system"
+                                and "Device catalog (JSON):\n" in message["content"]))
+
     def test_ollama_transmits_registered_context_and_copies_dynamic_tools(self):
         context = self.home.context()
         transport = FakeOllamaTransport()
@@ -81,8 +87,9 @@ class HomeContextTests(unittest.TestCase):
         model.predict(text="What can you control in the entry?")
         payload = transport.sent[-1][1]
         self.assertEqual(payload["tools"], expected_tools)
-        system = payload["messages"][0]["content"]
-        catalog = self.catalog(system)
+        system = "\n".join(message["content"] for message in payload["messages"]
+                           if message["role"] == "system")
+        catalog = self.ollama_catalog(payload)
         self.assertEqual([item["id"] for item in catalog], ["hall_lamp", "bay_door"])
         self.assertEqual(catalog[0]["room"], "Entry")
         self.assertEqual(catalog[0]["aliases"], ["welcome light"])
@@ -122,9 +129,9 @@ class HomeContextTests(unittest.TestCase):
         with redirect_stdout(io.StringIO()):
             run_request(model, self.home, text="Which light is in my office?", debug=True)
         old_payload, new_payload = transport.sent[0][1], transport.sent[1][1]
-        self.assertEqual(self.catalog(old_payload["messages"][0]["content"])[0]["name"], "Hall lamp")
-        self.assertEqual(self.catalog(new_payload["messages"][0]["content"])[0]["aliases"], ["work light"])
-        self.assertEqual(self.catalog(new_payload["messages"][0]["content"])[0]["room"], "Office")
+        self.assertEqual(self.ollama_catalog(old_payload)[0]["name"], "Hall lamp")
+        self.assertEqual(self.ollama_catalog(new_payload)[0]["aliases"], ["work light"])
+        self.assertEqual(self.ollama_catalog(new_payload)[0]["room"], "Office")
         self.assertEqual({tool["function"]["name"] for tool in new_payload["tools"]}, {"set_lights", "get_device_state"})
         for tool in new_payload["tools"]:
             self.assertEqual(tool["function"]["parameters"]["properties"]["device"]["enum"], ["hall_lamp"])

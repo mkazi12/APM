@@ -2,10 +2,38 @@ import contextlib
 import io
 import sys
 import unittest
+import tempfile
+from pathlib import Path
 from unittest.mock import MagicMock, patch
-from apm.cli import main
+from apm.cli import main, run_request
 
 class SessionTests(unittest.TestCase):
+    def setUp(self):
+        from apm.music import MusicService
+        music = patch("apm.music_connection.load_music_service", side_effect=MusicService)
+        music.start()
+        self.addCleanup(music.stop)
+        from apm.tasks import TaskService
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        path = Path(temporary.name) / "assistant.sqlite3"
+        service = patch("apm.tasks.TaskService", side_effect=lambda *_args, **_kwargs: TaskService(path, timezone="UTC"))
+        service.start()
+        self.addCleanup(service.stop)
+
+    def test_model_question_opens_followup_and_commits_context(self):
+        model = MagicMock()
+        home = MagicMock()
+        home.context.return_value = {"revision": 1}
+        home.execute.return_value = []
+        response = {"content": "Which room exactly?"}
+        model.predict.return_value = (response, {})
+        with contextlib.redirect_stdout(io.StringIO()):
+            reply = run_request(model, home, text="Turn on the lights")
+        self.assertEqual(reply, response["content"])
+        self.assertTrue(reply.expects_reply)
+        model.commit.assert_called_once_with(response, [])
+
     def test_multiple_commands_load_once_and_keep_device_state(self):
         factory = MagicMock()
         factory.return_value.predict.side_effect = [
