@@ -39,6 +39,51 @@ class Transport:
 
 
 class MusicKitTests(unittest.TestCase):
+    def test_pause_cancels_service_handoff_before_provider_enqueue(self):
+        for operation in ("play", "select", "resume"):
+            with self.subTest(operation=operation):
+                provider, session, _ = self.provider()
+                service = MusicService(provider)
+                selection = service.resolve("A Ballad")["track"]["selection_id"]
+                entered, release = threading.Event(), threading.Event()
+                method = "resume_guarded" if operation == "resume" else "play_guarded"
+                original = getattr(provider, method)
+                def delayed(*args):
+                    entered.set()
+                    if not release.wait(2):
+                        raise RuntimeError("Test handoff was not released")
+                    return original(*args)
+                setattr(provider, method, delayed)
+                action = (lambda: service.play("A Ballad")) if operation == "play" else (
+                    (lambda: service.select(selection)) if operation == "select" else service.resume)
+                old, results, errors = self.start_operation(action, provider)
+                try:
+                    self.assertTrue(entered.wait(1))
+                    pausing, pauses, pause_errors = self.start_operation(service.pause, provider)
+                    command = self.command(provider, session)
+                    self.assertEqual(command["operation"], "pause")
+                    provider.complete(session, command["id"], {"accepted": True, "playing": False, "was_playing": False})
+                    pausing.join(1)
+                    self.assertFalse(pausing.is_alive())
+                    self.assertEqual(pause_errors, [])
+                    self.assertEqual(pauses[0]["status"], "paused")
+                finally:
+                    release.set()
+                    old.join(2)
+                    setattr(provider, method, original)
+                self.assertFalse(old.is_alive())
+                self.assertEqual(errors, [])
+                self.assertEqual((results[0]["status"], results[0]["reason"]), ("unknown", "cancelled"))
+                self.assertIsNone(provider.poll(session, wait_seconds=0))
+                # A request started after pause is a new intent, not cancelled.
+                new, new_results, new_errors = self.start_operation(service.resume, provider)
+                command = self.command(provider, session)
+                self.assertEqual(command["operation"], "resume")
+                provider.complete(session, command["id"], {"accepted": True, "playing": True, "track_id": "123456789"})
+                new.join(1)
+                self.assertEqual(new_errors, [])
+                self.assertEqual(new_results[0]["status"], "resumed")
+
     def provider(self, pages=None, *, clock=None, timeout=1):
         transport = Transport(pages)
         provider = MusicKitProvider(lambda: "synthetic-developer-token", request=transport,

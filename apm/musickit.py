@@ -308,6 +308,11 @@ class MusicKitProvider:
         track_id = _track_id(track_id)
         return self._command("play", track_id, self._command_timeout)
 
+    def play_guarded(self, track_id, cancelled):
+        """Cancel a service intent atomically with enqueuing its playback."""
+        track_id = _track_id(track_id)
+        return self._command("play", track_id, self._command_timeout, cancelled=cancelled)
+
     def pause(self):
         return self._command("pause", None, self._pause_timeout)
 
@@ -316,8 +321,13 @@ class MusicKitProvider:
         # catalog request or remembered search ID, and must never replace it.
         return self._command("resume", None, self._command_timeout)
 
-    def _command(self, operation, track_id, timeout):
+    def resume_guarded(self, cancelled):
+        return self._command("resume", None, self._command_timeout, cancelled=cancelled)
+
+    def _command(self, operation, track_id, timeout, *, cancelled=None):
         with self._condition:
+            if cancelled is not None and cancelled.is_set():
+                raise MusicPlaybackError("cancelled")
             now = self._now()
             self._expire(now)
             if self._closed or self._session is None:

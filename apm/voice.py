@@ -269,6 +269,12 @@ def _wait_for_quiet(microphone, speech):
 
 
 _PAUSE_FAILURE_MESSAGES = {
+    "disconnected": (
+        "The music player disconnected, so APM cannot confirm it is quiet. "
+        "Pause any old player tabs and reconnect the player you want to use."),
+    "unsupported": (
+        "The music provider cannot confirm pause. "
+        "Use a player that supports pause before starting voice mode."),
     "authorization_lost": (
         "Apple Music authorization ended and the player could not confirm it stopped. "
         "Open its player tab and reconnect Apple Music."),
@@ -311,8 +317,9 @@ def _pause_for_capture(microphone, speech, pause_music):
         outcome = {"status": "unknown"}
     if not isinstance(outcome, dict):
         return None
-    if outcome.get("status") == "unavailable":
-        # APM can still listen without a configured/connected music player.
+    if outcome.get("status") == "unavailable" and outcome.get("reason") == "not_configured":
+        # No configured provider is safe. A lost connection or unsupported
+        # pause says nothing about audio still playing in a browser tab.
         return False
     if outcome.get("status") != "paused" or outcome.get("playing") is not False:
         reason = outcome.get("reason")

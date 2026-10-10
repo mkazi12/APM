@@ -24,6 +24,7 @@ UTC = datetime_timezone.utc
 MAX_SECONDS = 365 * 24 * 60 * 60
 KINDS = {"timer", "reminder"}
 STATUSES = {"scheduled", "paused", "completed", "cancelled", "due"}
+SCHEMA_VERSION = 2
 
 
 def _zone(value):
@@ -107,16 +108,17 @@ class TaskService:
         connection = sqlite3.connect(str(self.path) if self.path else ":memory:", timeout=5,
                                      isolation_level=None, check_same_thread=False)
         connection.row_factory = sqlite3.Row
+        connection.create_function("task_casefold", 1, str.casefold, deterministic=True)
         self._db = connection
         try:
             connection.execute("PRAGMA busy_timeout = 5000")
             connection.execute("PRAGMA foreign_keys = ON")
-            if connection.execute("PRAGMA user_version").fetchone()[0] > 1:
+            if connection.execute("PRAGMA user_version").fetchone()[0] > SCHEMA_VERSION:
                 raise ValueError("Task database was created by a newer application version")
             connection.execute("PRAGMA journal_mode = WAL")
             with self._transaction() as db:
                 version = db.execute("PRAGMA user_version").fetchone()[0]
-                if version > 1:
+                if version > SCHEMA_VERSION:
                     raise ValueError("Task database was created by a newer application version")
                 if version == 0:
                     existing = db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").fetchone()
@@ -140,10 +142,40 @@ class TaskService:
                     db.execute("CREATE INDEX tasks_due ON tasks(status, due_at)")
                     db.execute("CREATE INDEX notifications_pending ON notifications(delivered_at, acknowledged_at, leased_until)")
                     db.execute("PRAGMA user_version = 1")
+                    version = 1
+                if version == 1:
+                    self._migrate_occurrences(db)
             self._secure_sidecars()
         except BaseException:
             self.close()
             raise
+
+    @staticmethod
+    def _migrate_occurrences(db):
+        """Preserve v1 history while separating occurrence identity from time."""
+        db.execute("ALTER TABLE tasks ADD COLUMN occurrence INTEGER NOT NULL DEFAULT 0")
+        db.execute("""CREATE TABLE notifications_v2 (
+            id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id),
+            kind TEXT NOT NULL, name TEXT NOT NULL, due_at TEXT NOT NULL,
+            created_at TEXT NOT NULL, delivered_at TEXT, acknowledged_at TEXT,
+            leased_until TEXT, claim_token TEXT, invalidated_at TEXT,
+            delivery_attempts INTEGER NOT NULL DEFAULT 0, last_attempt_at TEXT,
+            occurrence INTEGER NOT NULL, UNIQUE(task_id, occurrence))""")
+        db.execute("""INSERT INTO notifications_v2 (
+            id,task_id,kind,name,due_at,created_at,delivered_at,acknowledged_at,
+            leased_until,claim_token,invalidated_at,delivery_attempts,last_attempt_at,occurrence)
+            SELECT id,task_id,kind,name,due_at,created_at,delivered_at,acknowledged_at,
+            leased_until,claim_token,invalidated_at,delivery_attempts,last_attempt_at,
+            ROW_NUMBER() OVER (PARTITION BY task_id ORDER BY created_at,due_at,id)-1
+            FROM notifications""")
+        db.execute("""UPDATE tasks SET occurrence=(
+            SELECT COUNT(*) FROM notifications_v2 WHERE task_id=tasks.id)""")
+        db.execute("DROP TABLE notifications")
+        db.execute("ALTER TABLE notifications_v2 RENAME TO notifications")
+        db.execute("CREATE INDEX notifications_pending ON notifications(delivered_at, acknowledged_at, leased_until)")
+        if db.execute("PRAGMA foreign_key_check").fetchone() is not None:
+            raise ValueError("Task database contains invalid notification references")
+        db.execute("PRAGMA user_version = 2")
 
     def _secure_sidecars(self):
         if self.path is not None:
@@ -212,7 +244,7 @@ class TaskService:
             "clock": (set(), {"timezone"}),
             "create_timer": ({"name", "duration_seconds"}, set()),
             "create_reminder": ({"name", "due_at"}, {"timezone", "repeat"}),
-            "list_tasks": (set(), {"kind", "status"}),
+            "list_tasks": (set(), {"kind", "status", "name"}),
             "get_task": ({"id"}, set()),
             "update_timer": ({"id", "action"}, {"seconds"}),
             "snooze_task": ({"id", "duration_seconds"}, set()),
@@ -234,6 +266,8 @@ class TaskService:
         elif operation == "create_reminder":
             self._reminder_values(kwargs["name"], kwargs["due_at"], kwargs.get("timezone"), kwargs.get("repeat"), self._now())
         elif operation == "list_tasks":
+            if kwargs.get("name") is not None:
+                _name(kwargs["name"])
             for field, allowed in (("kind", KINDS), ("status", STATUSES)):
                 value = kwargs.get(field)
                 if value is not None and (not isinstance(value, str) or value not in allowed):
@@ -253,6 +287,7 @@ class TaskService:
         result = dict(row)
         result.pop("anchor_local")
         result.pop("anchor_fold")
+        result.pop("occurrence")
         if result["kind"] == "timer":
             if result["status"] == "scheduled":
                 result["remaining_seconds"] = max(0.0, (_date(result["due_at"]) - now).total_seconds())
@@ -287,14 +322,16 @@ class TaskService:
                        (identifier, name, _iso(due), zone, repeat, anchor, fold, _iso(now), _iso(now)))
             return self._task(self._task_row(db, identifier), now)
 
-    def list_tasks(self, kind=None, status=None):
-        self.validate_request("list_tasks", {"kind": kind, "status": status})
+    def list_tasks(self, kind=None, status=None, name=None):
+        self.validate_request("list_tasks", {"kind": kind, "status": status, "name": name})
+        query = _name(name).casefold() if name is not None else None
         with self._lock:
             now = self._now()
             rows = self._open().execute("""SELECT * FROM tasks WHERE (? IS NULL OR kind=?) AND (? IS NULL OR status=?)
+                AND (? IS NULL OR instr(task_casefold(name),?)>0)
                 ORDER BY CASE status WHEN 'due' THEN 0 WHEN 'scheduled' THEN 1 WHEN 'paused' THEN 2 ELSE 3 END,
                 CASE WHEN status IN ('due','scheduled') THEN due_at END, created_at DESC, id LIMIT 100""",
-                                       (kind, kind, status, status)).fetchall()
+                                       (kind, kind, status, status, query, query)).fetchall()
             return [self._task(row, now) for row in rows]
 
     def get_task(self, id):
@@ -365,8 +402,9 @@ class TaskService:
                 due = None if status == "paused" else _iso(now + timedelta(seconds=remaining))
                 if status == "scheduled":
                     remaining = None
-            db.execute("UPDATE tasks SET status=?,due_at=?,remaining_seconds=?,duration_seconds=?,updated_at=? WHERE id=?",
-                       (status, due, remaining, duration, _iso(now), identifier))
+            db.execute("""UPDATE tasks SET status=?,due_at=?,remaining_seconds=?,duration_seconds=?,updated_at=?,
+                          occurrence=occurrence+? WHERE id=?""",
+                       (status, due, remaining, duration, _iso(now), int(action == "extend"), identifier))
             return self._task(self._task_row(db, identifier), now)
 
     def snooze_task(self, id, duration_seconds):
@@ -376,7 +414,8 @@ class TaskService:
             if row["status"] not in {"due", "scheduled"}:
                 raise ValueError("Only a scheduled or due task can be snoozed")
             self._invalidate(db, identifier, now)
-            db.execute("UPDATE tasks SET status='scheduled',due_at=?,remaining_seconds=NULL,updated_at=? WHERE id=?",
+            db.execute("""UPDATE tasks SET status='scheduled',due_at=?,remaining_seconds=NULL,updated_at=?,
+                          occurrence=occurrence+1 WHERE id=?""",
                        (_iso(now + timedelta(seconds=seconds)), _iso(now), identifier))
             return self._task(self._task_row(db, identifier), now)
 
@@ -401,6 +440,7 @@ class TaskService:
     @staticmethod
     def _event(row, *, include_token=False):
         result = dict(row)
+        result.pop("occurrence")
         if not include_token:
             result["claim_token"] = None
         return result
@@ -414,11 +454,11 @@ class TaskService:
                               (stamp,)).fetchall()
             for row in rows:
                 identifier = str(uuid.uuid4())
-                db.execute("""INSERT INTO notifications(id,task_id,kind,name,due_at,created_at)
-                              VALUES (?,?,?,?,?,?)""", (identifier, row["id"], row["kind"], row["name"], row["due_at"], stamp))
+                db.execute("""INSERT INTO notifications(id,task_id,kind,name,due_at,created_at,occurrence)
+                              VALUES (?,?,?,?,?,?,?)""", (identifier, row["id"], row["kind"], row["name"], row["due_at"], stamp, row["occurrence"]))
                 if row["repeat"]:
                     due = _iso(self._next_occurrence(row, now))
-                    db.execute("UPDATE tasks SET due_at=?,updated_at=? WHERE id=?", (due, stamp, row["id"]))
+                    db.execute("UPDATE tasks SET due_at=?,updated_at=?,occurrence=occurrence+1 WHERE id=?", (due, stamp, row["id"]))
                 else:
                     db.execute("UPDATE tasks SET status='due',remaining_seconds=NULL,updated_at=? WHERE id=?", (stamp, row["id"]))
                 events.append(self._event(db.execute("SELECT * FROM notifications WHERE id=?", (identifier,)).fetchone()))

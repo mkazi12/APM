@@ -44,6 +44,38 @@ class TaskServiceTests(unittest.TestCase):
         events = self.service.process_due()
         return task, events[0]
 
+    def legacy_database(self):
+        """A real v1 fixture, independent of the current schema initializer."""
+        path = self.path.with_name("legacy.sqlite3")
+        identifier, first, second, token = (str(uuid.uuid4()) for _ in range(4))
+        with sqlite3.connect(path) as db:
+            db.executescript("""
+                CREATE TABLE tasks (
+                    id TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('timer','reminder')),
+                    name TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('scheduled','paused','completed','cancelled','due')),
+                    due_at TEXT, timezone TEXT NOT NULL, repeat TEXT, remaining_seconds REAL, duration_seconds REAL,
+                    anchor_local TEXT, anchor_fold INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT, cancelled_at TEXT);
+                CREATE TABLE notifications (
+                    id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), kind TEXT NOT NULL,
+                    name TEXT NOT NULL, due_at TEXT NOT NULL, created_at TEXT NOT NULL,
+                    delivered_at TEXT, acknowledged_at TEXT, leased_until TEXT, claim_token TEXT, invalidated_at TEXT,
+                    delivery_attempts INTEGER NOT NULL DEFAULT 0, last_attempt_at TEXT, UNIQUE(task_id,due_at));
+                CREATE INDEX tasks_due ON tasks(status,due_at);
+                CREATE INDEX notifications_pending ON notifications(delivered_at,acknowledged_at,leased_until);
+                PRAGMA user_version=1;
+            """)
+            db.execute("""INSERT INTO tasks(id,kind,name,status,due_at,timezone,repeat,anchor_local,created_at,updated_at)
+                VALUES (?,'reminder','Daily','scheduled','2026-10-08T09:00:00.000000Z','UTC','daily',
+                        '2026-10-06T09:00:00','2026-10-05T12:00:00.000000Z','2026-10-07T12:00:00.000000Z')""", (identifier,))
+            db.execute("""INSERT INTO notifications(id,task_id,kind,name,due_at,created_at,delivered_at,acknowledged_at,delivery_attempts,last_attempt_at)
+                VALUES (?,?,'reminder','Daily','2026-10-06T09:00:00.000000Z','2026-10-06T09:00:00.000000Z',
+                        '2026-10-06T09:00:01.000000Z','2026-10-06T09:00:02.000000Z',1,'2026-10-06T09:00:00.000000Z')""", (first,identifier))
+            db.execute("""INSERT INTO notifications(id,task_id,kind,name,due_at,created_at,leased_until,claim_token,delivery_attempts,last_attempt_at)
+                VALUES (?,?,'reminder','Daily','2026-10-07T09:00:00.000000Z','2026-10-07T12:00:00.000000Z',
+                        '2026-10-07T12:00:30.000000Z',?,2,'2026-10-07T12:00:00.000000Z')""", (second,identifier,token))
+        return path, identifier, second, token
+
     def test_clock_uses_correct_local_date_and_offset(self):
         result = self.service.clock("America/Los_Angeles")
         self.assertEqual(result["date"], "2026-10-07")
@@ -241,6 +273,88 @@ class TaskServiceTests(unittest.TestCase):
         self.assertEqual(listed[0]["id"], active["id"])
         self.assertEqual(len(self.service.list_tasks(status="scheduled")), 1)
 
+    def test_name_search_filters_before_limit_with_unicode_and_literal_wildcards(self):
+        for index in range(101):
+            self.service.create_timer(f"Earlier timer {index}", 10)
+        matching = self.service.create_timer("Straße 100%_ Tea", 600)
+        self.service.validate_request("list_tasks", {"name":"STRASSE 100%_", "kind":"timer", "status":"scheduled"})
+        found = self.service.list_tasks(name="STRASSE 100%_", kind="timer", status="scheduled")
+        self.assertEqual([task["id"] for task in found], [matching["id"]])
+        self.assertEqual(self.service.list_tasks(name="100%_", status="paused"), [])
+        self.assertEqual(self.service.list_tasks(name="100X_"), [])
+        for invalid in ("", "   ", True, "x" * 121):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                self.service.list_tasks(name=invalid)
+
+    def test_rearming_same_deadline_creates_new_occurrence_and_invalidates_old_claim(self):
+        for action in ("snooze", "extend"):
+            with self.subTest(action=action):
+                task, old = self.due_timer()
+                claimed = self.service.claim_notification()
+                self.clock.advance(-30)
+                if action == "snooze":
+                    updated = self.service.snooze_task(task["id"], 30)
+                else:
+                    # A due timer's old deadline may be future after a clock
+                    # correction; tiny additions round back to that deadline.
+                    updated = self.service.update_timer(task["id"], "extend", 1e-9)
+                self.assertEqual(updated["due_at"], old["due_at"])
+                self.assertFalse(self.service.notification_is_claimed(old["id"], claimed["claim_token"]))
+                self.clock.advance(31)
+                other = self.open()
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    produced = list(executor.map(lambda service: service.process_due(), [self.service,other]))
+                fresh = [event for events in produced for event in events]
+                self.assertEqual(len(fresh), 1)
+                self.assertNotEqual(fresh[0]["id"], old["id"])
+                self.assertEqual(fresh[0]["due_at"], old["due_at"])
+                self.assertNotIn("occurrence", fresh[0])
+                self.assertNotIn("occurrence", self.service.get_task(task["id"]))
+                self.service.acknowledge_notification(fresh[0]["id"])
+
+    def test_v1_migration_preserves_history_leases_and_recurring_schedule(self):
+        path, identifier, event, token = self.legacy_database()
+        with sqlite3.connect(path) as db:
+            db.row_factory = sqlite3.Row
+            original = {row["id"]:dict(row) for row in db.execute("SELECT * FROM notifications")}
+        migrated = TaskService(path, timezone="UTC", now=self.clock)
+        self.addCleanup(migrated.close)
+        self.assertEqual(migrated.get_task(identifier)["due_at"], "2026-10-08T09:00:00.000000Z")
+        self.assertTrue(migrated.notification_is_claimed(event, token))
+        with sqlite3.connect(path) as db:
+            db.row_factory = sqlite3.Row
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 2)
+            after = {row["id"]:{key:row[key] for key in row.keys() if key != "occurrence"}
+                     for row in db.execute("SELECT * FROM notifications")}
+            self.assertEqual(after, original)
+            self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
+        migrated.snooze_task(identifier, 60)
+        self.assertFalse(migrated.notification_is_claimed(event, token))
+        self.clock.advance(60)
+        self.assertEqual(len(migrated.process_due()), 1)
+        self.clock.value = datetime.fromisoformat("2026-10-08T09:00:00+00:00")
+        self.assertEqual(len(migrated.process_due()), 1)
+        self.assertEqual(migrated.get_task(identifier)["due_at"], "2026-10-09T09:00:00.000000Z")
+        migrated.close()
+        reopened = TaskService(path, timezone="UTC", now=self.clock)
+        self.addCleanup(reopened.close)
+        self.assertEqual(len(reopened.notifications()), 4)
+        self.assertEqual(reopened.process_due(), [])
+
+    def test_failed_v1_migration_rolls_back_schema_and_history(self):
+        path, _, _, _ = self.legacy_database()
+        migrate = TaskService._migrate_occurrences
+        def fail_after_migration(db):
+            migrate(db)
+            raise OSError("Synthetic migration failure")
+        with patch.object(TaskService, "_migrate_occurrences", side_effect=fail_after_migration), self.assertRaises(OSError):
+            TaskService(path, timezone="UTC", now=self.clock)
+        with sqlite3.connect(path) as db:
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 1)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM notifications").fetchone()[0], 2)
+            self.assertNotIn("occurrence", [row[1] for row in db.execute("PRAGMA table_info(tasks)")])
+            self.assertIsNone(db.execute("SELECT name FROM sqlite_master WHERE name='notifications_v2'").fetchone())
+
     def test_database_and_sidecars_are_private_and_newer_schema_is_refused(self):
         self.assertEqual(stat.S_IMODE(self.path.stat().st_mode), 0o600)
         for suffix in ("-wal", "-shm"):
@@ -249,7 +363,7 @@ class TaskServiceTests(unittest.TestCase):
                 self.assertEqual(stat.S_IMODE(sidecar.stat().st_mode), 0o600)
         self.service.close()
         with sqlite3.connect(self.path) as db:
-            db.execute("PRAGMA user_version = 2")
+            db.execute("PRAGMA user_version = 3")
         with self.assertRaisesRegex(ValueError, "newer"):
             TaskService(self.path, timezone="UTC")
 

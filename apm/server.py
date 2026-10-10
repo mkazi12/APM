@@ -54,6 +54,22 @@ def _api_token(token: str | None) -> str | None:
     return token
 
 
+def _same_origin(origin: str, *, scheme: str, authority: str) -> bool:
+    """Compare browser origins without treating loopback aliases as equivalent."""
+    default_ports = {"http": 80, "https": 443}
+    if scheme not in default_ports or not _local_authority(origin, origin=True):
+        return False
+    # The middleware has already validated the serving Host header.
+    supplied = urlsplit(origin)
+    serving = urlsplit("//" + authority)
+    return (
+        supplied.scheme == scheme
+        and supplied.hostname == serving.hostname
+        and (supplied.port or default_ports[supplied.scheme])
+        == (serving.port or default_ports[scheme])
+    )
+
+
 def create_app(home: Any, token: str | None = None, *, tasks=None, scheduler=None, music=None):
     """Create a local API around a validated HomeController-compatible object.
 
@@ -115,7 +131,8 @@ def create_app(home: Any, token: str | None = None, *, tasks=None, scheduler=Non
         if len(hosts) != 1 or not _local_authority(hosts[0]):
             return error(400, "Untrusted Host header.")
         origins = request.headers.getlist("origin")
-        if origins and (len(origins) != 1 or not _local_authority(origins[0], origin=True)):
+        if origins and (len(origins) != 1 or not _same_origin(
+                origins[0], scheme=request.scope["scheme"], authority=hosts[0])):
             return error(403, "Untrusted request origin.")
         if configured_token is not None and request.url.path not in _PUBLIC_DOC_PATHS:
             authorization = request.headers.getlist("authorization")

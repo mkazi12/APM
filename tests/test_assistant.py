@@ -153,6 +153,22 @@ class AssistantTests(unittest.TestCase):
         result = self.assistant.execute([call("get_scheduled_task", task_id=timers[0]["id"])])[0]
         self.assertEqual(result["data"]["remaining_seconds"], 477)
 
+    def test_exact_name_beyond_storage_cap_can_be_found_and_cancelled(self):
+        for index in range(100):
+            self.tasks.create_timer(f"Earlier timer {index}", 60)
+        target = self.tasks.create_timer("Straße afternoon tea", 3600)
+        self.assertNotIn(target["id"], [task["id"] for task in self.assistant.context()["scheduled_tasks"]])
+        result = self.assistant.execute([call("list_scheduled_tasks", name="STRASSE afternoon tea",
+                                              kind="timer", status="scheduled")])[0]
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["truncated"])
+        self.assertEqual([task["id"] for task in result["data"]], [target["id"]])
+        cancelled = self.assistant.execute([call("cancel_scheduled_task", task_id=result["data"][0]["id"])])[0]
+        self.assertEqual(cancelled["data"]["status"], "cancelled")
+        missing = self.assistant.execute([call("list_scheduled_tasks", name="No such timer")])[0]
+        self.assertEqual(missing["data"], [])
+        self.assertFalse(missing["truncated"])
+
     def test_list_and_reminder_confirmations_are_plain_backend_facts(self):
         result = self.assistant.execute([call("create_reminder", name="Bins", due_at="2026-10-08T08:00:00-07:00",
                                              timezone="America/Los_Angeles", repeat="weekly")])

@@ -1,5 +1,6 @@
 """Catalog fixtures use synthetic IDs; no provider or playback is contacted."""
 from dataclasses import replace
+import threading
 import unittest
 from unittest.mock import Mock
 import uuid
@@ -37,6 +38,37 @@ class Provider:
 
 
 class MusicTests(unittest.TestCase):
+    def test_pause_cancels_catalog_request_without_blocking_new_play_or_resume(self):
+        entered, release = threading.Event(), threading.Event()
+        provider = Provider()
+        def search(title, artist=None):
+            provider.searches.append((title, artist))
+            if len(provider.searches) == 1:
+                entered.set()
+                if not release.wait(2):
+                    raise RuntimeError("Test search was not released")
+            return [SONG]
+        provider.search = search
+        provider.pause = Mock(return_value=PlaybackResult(True, False, was_playing=False))
+        provider.resume = Mock(return_value=PlaybackResult(True, True, SONG.id))
+        service = MusicService(provider)
+        results = []
+        worker = threading.Thread(target=lambda: results.append(service.play(SONG.title, SONG.artists[0])))
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(1))
+            self.assertEqual(service.pause()["status"], "paused")
+            self.assertTrue(worker.is_alive(), "Pause must not wait for catalog/network I/O")
+            self.assertEqual(service.play(SONG.title, SONG.artists[0])["status"], "playing")
+            self.assertEqual(service.resume()["status"], "resumed")
+        finally:
+            release.set()
+            worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual((results[0]["status"], results[0]["reason"]), ("unknown", "cancelled"))
+        self.assertEqual(provider.plays, [SONG.id], "The earlier search must never dispatch playback")
+        self.assertEqual(len(service._play_intents), 0)
+
     def test_pause_preserves_safe_browser_failure_reason_without_start_playback_advice(self):
         for reason in MusicPlaybackError.REASONS:
             with self.subTest(reason=reason):

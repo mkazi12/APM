@@ -82,6 +82,7 @@ async function scenario(options = {}) {
   let queues = 0;
   let dispatched = 0;
   let emptyPollSent = false;
+  let connectionLossSent = false;
   let settlePlay;
   let queueLoads = 0;
   let maxQueueLoads = 0;
@@ -208,7 +209,12 @@ async function scenario(options = {}) {
   };
   const window = {
     location, MusicKit,
-    setTimeout(callback, milliseconds) { const timer = setTimeout(callback, milliseconds); timer.unref(); return timer; },
+    setTimeout(callback, milliseconds) {
+      // Simulate an early fractional timer callback without advancing the true
+      // performance clock. Deadline observers must recheck their budget.
+      const actual = options.earlyTimers && milliseconds > 2 && milliseconds < 100 ? milliseconds - 2 : milliseconds;
+      const timer = setTimeout(callback, actual); timer.unref(); return timer;
+    },
     clearTimeout,
     addEventListener(name, callback) { listen(events, name, callback); },
     removeEventListener(name, callback) { unlisten(events, name, callback); },
@@ -238,6 +244,17 @@ async function scenario(options = {}) {
         : response({ ok: true });
     }
     if (url.startsWith("/v1/player/commands?")) {
+      if (options.connectionLoss && dispatched >= (options.connectionLossAfter || 1) && !connectionLossSent) {
+        connectionLossSent = true;
+        await sleep(options.lossDuringQueue || options.lossDuringStart ? 5 : 15);
+        if (options.connectionLoss === "network") throw new TypeError("Synthetic offline transport");
+        return { ok: false, status: options.connectionLoss, json: async () => ({ error: "Synthetic session failure" }) };
+      }
+      if (options.reconnectAfterLoss && connectionLossSent && dispatched === 1 &&
+          calls.filter((call) => call.url === "/v1/player/session").length === 2) {
+        dispatched += 1;
+        return response({ command: { id: "new-resume", operation: "resume", expires_in_ms: 20000 } });
+      }
       if (options.commands && dispatched < options.commands.length) {
         const { deliveryDelay = 0, afterResult, manualPause, ...command } = options.commands[dispatched++];
         if (afterResult) {
@@ -322,6 +339,61 @@ async function scenario(options = {}) {
   let subscriptionsBeforePlayback = [...sdkEvents].map(([name, callbacks]) => [name, callbacks.size]);
   await get("connect").listeners.click[0]();
   await sleep(options.queueDelay ? options.queueDelay + 40 : options.shortDeadline || options.pauseShort ? 120 : 30);
+  if (options.rapidReconnect) {
+    const limit = performance.now() + 100;
+    while (get("connection-title").textContent !== "Player disconnected") {
+      assert.ok(performance.now() < limit, "The connection must fail before reconnecting");
+      await sleep(1);
+    }
+    assert.equal(pauses, 1, "The new safety pause must still be waiting on the SDK cooldown");
+    assert.equal(music.playbackState, 2);
+    await get("connect").listeners.click[0]();
+  }
+  if (options.manualDisconnect) await Promise.race([
+    get("disconnect").listeners.click[0](),
+    sleep(1500).then(() => { throw new Error("Disconnect did not finish within its local pause budget"); }),
+  ]);
+  if (options.connectionLoss || options.manualDisconnect) {
+    await sleep(options.pauseNoEffect ? 1250 : 400);
+    assert.equal(get("connection-title").textContent, options.rapidReconnect ? "Apple Music connected" : "Player disconnected");
+    assert.equal(get("start-playback").disabled, true);
+    assert.equal(calls.filter((call) => call.url.startsWith("/v1/player/commands?")).length, options.rapidReconnect ? 4 : 2,
+      "A failed connection must not retry polling or recover playback automatically");
+    const revocations = calls.filter((call) => call.url === "/v1/player/disconnect");
+    assert.equal(revocations.length, 1);
+    assert.equal(JSON.parse(revocations[0].init.body).session_id,
+      JSON.parse(calls.find((call) => call.url === "/v1/player/session").init.body).session_id);
+    if (options.pauseNoEffect) {
+      assert.equal(music.playbackState, 2);
+      assert.match(get("player-note").textContent, /pause could not be confirmed/);
+      assert.doesNotMatch(get("player-note").textContent, /Music is paused/);
+    } else {
+      assert.notEqual(music.playbackState, 2, "Lost sessions and late starts must not leave audio playing");
+      if (!options.rapidReconnect) assert.match(get("player-note").textContent, /Music is paused/);
+      if (!options.lossDuringQueue) assert.ok(pauses >= 1);
+    }
+    assert.equal(plays, options.lossDuringQueue ? 0 : 1, "No playback is retried after connection loss");
+    if (options.rapidReconnect) {
+      assert.equal(pauses, 2, "Reconnection must preserve the deferred safety pause");
+      assert.equal(suppressedControls, 0);
+      assert.ok(sdkInvocations.pause[1] - sdkInvocations.pause[0] >= 250);
+      assert.doesNotMatch(get("player-note").textContent, /Reconnect the player|Connection ended/,
+        "The old connection must not overwrite the replacement session's status");
+    }
+    if (options.reconnectAfterLoss) {
+      await get("connect").listeners.click[0]();
+      await sleep(300);
+      assert.equal(get("connection-title").textContent, "Apple Music connected");
+      assert.equal(music.playbackState, 2, "An explicit new resume can release the old pause hold");
+      assert.equal(plays, 2);
+      assert.equal(queues, 1, "Resume must preserve the existing queue");
+      assert.equal(calls.filter((call) => call.url === "/v1/player/disconnect").length, 1,
+        "The previous loss must not revoke the replacement session");
+    }
+    emit(events, "pagehide", {});
+    return;
+  }
+  if (options.authLostDuringPlayback) await sleep(1250);
   if (options.race === "manual_start") {
     assert.equal(calls.some((call) => call.url.includes("pause-command/result")), false,
       "Pause cannot confirm quiet while a manual native play Promise may still start audio");
@@ -398,6 +470,7 @@ async function scenario(options = {}) {
     if (options.expectedPlaybackDiagnostic) {
       for (const [key, value] of Object.entries(options.expectedPlaybackDiagnostic)) assert.equal(diagnostic[key], value, `Diagnostic ${key}`);
     }
+    if (options.earlyTimers) assert.ok(diagnostic.elapsed_ms >= 50, "Early timers must preserve the absolute command budget");
     if (options.noPlaybackSDKReason) assert.equal(Object.hasOwn(diagnostic, "sdk_reason"), false);
   }
   if (options.expectedPlaybackDiagnostic) assert.ok(localDiagnostics, "The latest diagnostic must remain visible even if a session ended");
@@ -615,10 +688,23 @@ async function scenario(options = {}) {
     { queueDelay: 90, expectedPlaybackDiagnostic: { phase: "queue", reason: "timeout" } },
     { deferredPlay: true, playEventDelay: 5 }, { rejectPlay: true },
     { wrongPlayingTrack: true, shortDeadline: true, expectedPlaybackDiagnostic: { phase: "confirm", reason: "timeout", track_matches: false } },
+    { wrongPlayingTrack: true, shortDeadline: true, earlyTimers: true,
+      expectedPlaybackDiagnostic: { phase: "confirm", reason: "timeout", track_matches: false } },
     { wrongPlayingTrack: true, correctTrackLater: true, deferredPlay: true },
     { latePlaying: true, playEventDelay: 90, shortDeadline: true },
     { mediaErrorEvent: true, expectedPlaybackDiagnostic: { reason: "media_error" } },
     { abortDuringPlayback: true, expectedPlaybackDiagnostic: { reason: "cancelled" } }, { emptyPollFirst: true },
+    { connectionLoss: 400 }, { connectionLoss: 409 }, { connectionLoss: 503 }, { connectionLoss: "network" },
+    { connectionLoss: 400, lossDuringStart: true, playEventDelay: 90, pendingStartDelay: 100 },
+    { connectionLoss: "network", lossDuringQueue: true, queueDelay: 90 },
+    { connectionLoss: 400, pauseNoEffect: true },
+    { connectionLoss: 400, reconnectAfterLoss: true },
+    { connectionLoss: 400, connectionLossAfter: 2, rapidReconnect: true, controlSequence: "reconnect_loss", sequencePlaying: true,
+      commands: [
+        { id: "before-loss-pause", operation: "pause", expires_in_ms: 1500 },
+        { id: "before-loss-resume", operation: "resume", expires_in_ms: 20000, afterResult: "before-loss-pause" },
+      ] },
+    { manualDisconnect: true }, { manualDisconnect: true, pauseNoEffect: true },
     { pauseCommand: true, expectedPlaybackDiagnostic: { phase: "confirm", reason: "confirmed", state: "paused" } }, { pauseCommand: true, pauseIdle: true },
     { pauseCommand: true, pauseIdle: true, pauseThrow: true },
     { pauseCommand: true, pauseIdle: true, pauseReject: true },

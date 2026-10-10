@@ -23,6 +23,8 @@ Try “Set a pasta timer for ten minutes,” “How much time is left on the pas
 
 Both processes must point to the same database file; relative paths resolve from their working directory. Database files and SQLite journal sidecars are ignored by Git. New database files are created with owner-only permissions. Do not copy only the main database file while it is open in WAL mode; stop the processes or use a SQLite backup operation.
 
+After upgrading, restart both processes together. The task service upgrades older databases transactionally, preserving tasks and notification history. Each scheduled occurrence has its own identity, so a snooze can reuse an earlier deadline after a clock correction without blocking other notifications.
+
 ## Clock and timers
 
 ```sh
@@ -78,7 +80,7 @@ Delivery uses expiring claims shared across processes. A crash between printing 
 
 ## Model boundary and memory
 
-Gemma sees the current clock and up to 20 active tasks, including actual IDs. It can list or read tasks when more detail is needed; API lists return at most 100 records with active tasks first. The model's list tool can filter that result by part of a name and returns at most 20 records with an explicit truncation flag. User-supplied names are descriptive data, not instructions. Every mixed batch of home and scheduling calls is schema-validated before any action; invalid date/time arguments are checked before execution too. Runtime failures stop later calls, but earlier actions cannot be rolled back across services.
+Gemma sees the current clock and up to 20 active tasks, including actual IDs. It can list or read tasks when more detail is needed; API lists return at most 100 records with active tasks first. The model's list tool searches all stored tasks by part of a name before applying these limits, using Unicode case-insensitive matching. It returns at most 20 records with an explicit truncation flag. User-supplied names are descriptive data, not instructions. Every mixed batch of home and scheduling calls is schema-validated before any action; invalid date/time arguments are checked before execution too. Runtime failures stop later calls, but earlier actions cannot be rolled back across services.
 
 Scheduling records are durable memory for these tasks. They do not train or alter the model. Conversation memory still retains only the last four exchanges in the running client. Saved personal facts, long-term conversation retrieval, calendars, and external messaging are separate future services.
 

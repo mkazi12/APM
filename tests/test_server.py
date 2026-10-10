@@ -122,7 +122,7 @@ class ServerTests(unittest.TestCase):
     def test_public_docs_support_bearer_authorization_without_exposing_secrets(self):
         client = TestClient(create_app(self.home, token="private-api-token"))
         for path in ("/docs", "/redoc", "/openapi.json"):
-            result = client.get(path)
+            result = client.get(path, headers={"Origin": "http://testserver"})
             self.assertEqual(result.status_code, 200)
             self.assertNotIn("private-api-token", result.text)
         schema = client.get("/openapi.json").json()
@@ -131,7 +131,8 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(client.get("/docs", headers={"Host": "evil.example"}).status_code, 400)
         self.assertEqual(client.get("/openapi.json", headers={"Origin": "https://evil.example"}).status_code, 403)
         self.assertEqual(client.get("/v1/devices").status_code, 401)
-        self.assertEqual(client.get("/v1/devices", headers={"Authorization": "Bearer private-api-token"}).status_code, 200)
+        self.assertEqual(client.get("/v1/devices", headers={"Authorization": "Bearer private-api-token",
+                                                          "Origin": "http://testserver"}).status_code, 200)
 
     def test_environment_token_and_explicit_override(self):
         with patch.dict(os.environ, {"APM_API_TOKEN": "environment-secret"}):
@@ -149,15 +150,37 @@ class ServerTests(unittest.TestCase):
         for host in ("evil.example", "127.0.0.1.evil.example", "localhost@evil.example", "localhost:99999", "localhost/path"):
             with self.subTest(host=host):
                 self.assertEqual(self.client.get("/v1/devices", headers={"Host": host}).status_code, 400)
-        for origin in ("https://evil.example", "null", "http://localhost.evil.example", "http://user:secret@localhost", "http://localhost/path"):
+        for origin in ("https://evil.example", "null", "http://localhost.evil.example", "http://user:secret@localhost",
+                       "http://localhost/path", "http://[", "http://127.0.0.1:8765", "http://localhost:8765"):
             with self.subTest(origin=origin):
                 result = self.client.post("/v1/devices/kitchen/commands", json={"state": "on"}, headers={"Origin": origin})
                 self.assertEqual(result.status_code, 403)
                 self.assertNotIn("access-control-allow-origin", result.headers)
         self.assertEqual(self.home.calls, [])
-        for origin in ("http://127.0.0.1:8765", "http://localhost:8765", "http://testserver"):
-            self.assertEqual(self.client.get("/health", headers={"Origin": origin}).status_code, 200)
+        self.assertEqual(self.client.get("/health", headers={"Origin": "http://testserver"}).status_code, 200)
         self.assertEqual(self.client.get("/health").headers["cache-control"], "no-store")
+
+    def test_browser_origin_matches_serving_scheme_hostname_and_effective_port(self):
+        cases = (
+            ("http://127.0.0.1:8765", "http://127.0.0.1:8765", 200),
+            ("http://127.0.0.1:8765", "http://127.0.0.1:8766", 403),
+            ("http://127.0.0.1:8765", "http://localhost:8765", 403),
+            ("http://127.0.0.1:8765", "https://127.0.0.1:8765", 403),
+            ("http://localhost", "http://LOCALHOST:80", 200),
+            ("http://localhost:80", "http://localhost", 200),
+            ("https://localhost", "https://localhost:443", 200),
+            ("https://localhost:443", "https://localhost", 200),
+            ("https://localhost", "https://localhost:80", 403),
+            ("http://[::1]:8765", "http://[::1]:8765", 200),
+            ("http://[::1]:8765", "http://localhost:8765", 403),
+        )
+        for serving, origin, status in cases:
+            with self.subTest(serving=serving, origin=origin):
+                client = TestClient(create_app(self.home, token=""), base_url=serving)
+                response = client.get("/health", headers={"Origin": origin})
+                self.assertEqual(response.status_code, status)
+                self.assertNotIn("access-control-allow-origin", response.headers)
+                self.assertEqual(client.get("/health").status_code, 200)
 
     def test_duplicate_security_headers_are_rejected(self):
         self.assertEqual(self.client.get("/health", headers=[("Host", "localhost"), ("Host", "evil.example")]).status_code, 400)

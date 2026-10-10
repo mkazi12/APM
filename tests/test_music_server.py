@@ -277,6 +277,30 @@ class MusicServerTests(unittest.TestCase):
         schema = client.get("/openapi.json").json()
         self.assertEqual(schema["paths"]["/v1/music/play"]["post"]["security"], [{"HTTPBearer": []}])
 
+    def test_bodyless_controls_reject_other_local_origins_even_with_valid_token(self):
+        for token in ("", "api-secret"):
+            with self.subTest(authenticated=bool(token)):
+                client = TestClient(create_app(self.home, token=token, music=self.music),
+                                    base_url="http://127.0.0.1:8765")
+                authorization = {"Authorization": "Bearer " + token} if token else {}
+                with patch.object(self.music, "pause", return_value={"status": "paused"}) as pause, \
+                        patch.object(self.music, "resume", return_value={"status": "resumed"}) as resume:
+                    for path in ("/v1/music/pause", "/v1/music/resume"):
+                        for origin in ("http://127.0.0.1:9999", "http://localhost:8765",
+                                       "https://127.0.0.1:8765"):
+                            response = client.post(path, headers={**authorization, "Origin": origin})
+                            self.assertEqual(response.status_code, 403)
+                            self.assertNotIn("access-control-allow-origin", response.headers)
+                    pause.assert_not_called()
+                    resume.assert_not_called()
+                    for path, action in (("/v1/music/pause", pause), ("/v1/music/resume", resume)):
+                        response = client.post(path, headers={**authorization, "Origin": "http://127.0.0.1:8765"})
+                        self.assertEqual(response.status_code, 200)
+                        action.assert_called_once_with()
+                        response = client.post(path, headers=authorization)
+                        self.assertEqual(response.status_code, 200)
+                        self.assertEqual(action.call_count, 2)
+
     def test_music_is_injected_into_combined_task_context_and_closed_once(self):
         from apm.home import HomeController
         from apm.music import MusicService

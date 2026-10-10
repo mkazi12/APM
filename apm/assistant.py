@@ -75,7 +75,7 @@ class AssistantController:
         if name in {"create_timer", "create_reminder"}:
             return name, args
         if name == "list_scheduled_tasks":
-            return "list_tasks", {key: value for key, value in args.items() if key != "name"}
+            return "list_tasks", args
         if name == "get_scheduled_task":
             return "get_task", {"id": args["task_id"]}
         if name in {"cancel_scheduled_task", "complete_scheduled_task"}:
@@ -145,10 +145,7 @@ class AssistantController:
                     data = method(kwargs.pop("id"), **kwargs) if "id" in kwargs else method(**kwargs)
                     result = {"tool": name, "ok": True, "data": data}
                     if name == "list_scheduled_tasks":
-                        source_limited = len(data) >= 100
-                        if "name" in args:
-                            data = [task for task in data if args["name"].casefold() in task["name"].casefold()]
-                        result.update(data=data[:20], truncated=source_limited or len(data) > 20)
+                        result.update(data=data[:20], truncated=len(data) > 20)
                 failed = result.get("ok") is False or (result.get("accepted") and result.get("state") == "unknown")
                 if name in music_operations and result["data"]["status"] not in {"matched", "playing", "paused", "resumed"}:
                     failed = True

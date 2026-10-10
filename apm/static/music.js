@@ -362,9 +362,9 @@
     ui.song.disabled = !connected || state.requestBusy;
     ui.songArtist.disabled = !connected || state.requestBusy;
     ui.submit.disabled = !connected || state.requestBusy;
-    ui.start.disabled = !authorized() || !state.requestedTrack || !state.queueReady ||
+    ui.start.disabled = !connected || !state.requestedTrack || !state.queueReady ||
       !queueMatches(state.music?.queue, state.requestedTrack) || state.manualStarting || playing() || state.disconnecting;
-    ui.pause.disabled = !authorized() || !playing() || state.disconnecting;
+    ui.pause.disabled = !state.music || !playing() || state.disconnecting;
     ui.candidates.querySelectorAll("button").forEach((button) => { button.disabled = !connected || state.requestBusy; });
   }
 
@@ -410,7 +410,7 @@
     ui.playbackState.textContent = isPlaying ? "Playing" :
       (states && playback === states.paused ? "Paused" : (state.requestedTrack && state.queueReady ? "Ready to play" : "Not playing"));
     if (state.requestedTrack && observedTrackID() === state.requestedTrack) state.queueReady = true;
-    if (isPlaying) ui.playerNote.textContent = "Playing through this browser on your Mac.";
+    if (isPlaying && state.sessionId && !state.pauseHold) ui.playerNote.textContent = "Playing through this browser on your Mac.";
     controls();
   }
 
@@ -505,9 +505,7 @@
       state.music.addEventListener("authorizationStatusDidChange", (event) => {
         try { diagnosticStatus(event?.authorizationStatus); } catch (_) { /* Never throw into SDK. */ }
         if (!authorized() && state.sessionId && !state.disconnecting) {
-          const oldSession = state.sessionId;
           loseConnection("Apple Music authorization ended. Connect again to continue.");
-          api("/v1/player/disconnect", { method: "POST", body: { session_id: oldSession }, timeout: 3000 }).catch(() => {});
         }
         controls();
       });
@@ -536,12 +534,48 @@
   }
 
   function loseConnection(message) {
+    const oldSession = state.sessionId;
     stopPolling();
     state.sessionId = null;
     state.requestNumber += 1;
     state.requestBusy = false;
     connection("error", "Player disconnected", message);
+    holdAndPauseLocalPlayback();
+    if (oldSession) api("/v1/player/disconnect", {
+      method: "POST", body: { session_id: oldSession }, timeout: 3000,
+    }).catch(() => {});
     controls();
+  }
+
+  function holdAndPauseLocalPlayback() {
+    // Losing the bridge must not leave audio playing or let a cancelled native
+    // start become audible later. Reconnection alone does not release this hold.
+    state.playEpoch += 1;
+    state.commandAbort?.abort();
+    state.manualAbort?.abort();
+    state.pauseHold = true;
+    state.requestedTrack = null;
+    state.queueReady = false;
+    const music = state.music;
+    const generation = state.generation;
+    const sessionId = state.sessionId;
+    if (!music) return Promise.resolve(true);
+    // Reconnecting changes the bridge generation, not the safety intent. Keep
+    // a pause waiting on the SDK cooldown alive until actual playback releases
+    // the hold; scope only its UI messages to the connection that requested it.
+    const current = () => state.music === music && state.pauseHold;
+    const displayCurrent = () => current() && state.generation === generation && state.sessionId === sessionId;
+    const trace = playbackTrace(performance.now());
+    ui.playerNote.textContent = "Connection ended. Pausing local playback…";
+    return pauseAndConfirm(current, performance.now() + 1200, pauseActivity(), trace).then(() => {
+      if (displayCurrent()) ui.playerNote.textContent = "Music is paused. Reconnect the player before requesting playback.";
+      renderPlayer();
+      return true;
+    }, () => {
+      if (displayCurrent()) ui.playerNote.textContent = "Local pause could not be confirmed. Stop audio using the browser's controls before reconnecting.";
+      renderPlayer();
+      return false;
+    });
   }
 
   async function connect() {
@@ -577,6 +611,7 @@
       state.queueReady = false;
       ui.reload.hidden = true;
       connection("connected", "Apple Music connected", `Your ${storefront.toUpperCase()} catalog is ready. Keep this tab open for APM requests.`);
+      ui.playerNote.textContent = "Request a song or resume the existing queue when you are ready.";
       result("Request a song below, or ask APM by voice.");
       const generation = state.generation;
       pollCommands(sessionId, generation);
@@ -819,6 +854,14 @@
       };
       const failed = (error) => finish(error || new PlaybackFailure("play_rejected"), "play_rejected");
       const cancelled = () => finish(playbackCurrentFailure(current, deadline) || new PlaybackFailure("cancelled"));
+      const expired = () => {
+        const remaining = deadline - performance.now();
+        if (remaining > 0) {
+          timer = window.setTimeout(expired, Math.ceil(remaining));
+          return;
+        }
+        finish(new PlaybackFailure("timeout"));
+      };
       const mediaFailed = () => finish(new PlaybackFailure("media_error"));
       const check = () => {
         if (settled) return;
@@ -839,7 +882,9 @@
         music.addEventListener("mediaPlaybackError", mediaFailed);
         subscriptions.push(["mediaPlaybackError", mediaFailed]);
         signal?.addEventListener("abort", cancelled, { once: true });
-        timer = window.setTimeout(cancelled, Math.max(1, deadline - performance.now()));
+        // Timer delays may be rounded down. Preserve the absolute budget and
+        // distinguish expiration from an external cancellation.
+        timer = window.setTimeout(expired, Math.max(1, Math.ceil(deadline - performance.now())));
         // Observe before play: confirmation may precede settlement of the
         // native startup Promise. Always handle its rejection after settling.
         const finalError = playbackCurrentFailure(current, deadline);
@@ -924,7 +969,9 @@
     } catch (error) {
       // Do not retry a play operation whose outcome is unknown.
       playbackFailure(trace, error, trace.phase === "queue" ? "queue_rejected" : "unknown");
-      ui.playerNote.textContent = playbackMessages[trace.reason] || playbackMessages.unknown;
+      if (state.sessionId === sessionId && state.generation === generation && !signal?.aborted) {
+        ui.playerNote.textContent = playbackMessages[trace.reason] || playbackMessages.unknown;
+      }
     } finally {
       renderPlayer();
     }
@@ -964,8 +1011,11 @@
           loseConnection("The local player session ended. Connect Apple Music again to resume requests.");
           return;
         }
-        connection("error", "Reconnecting to APM…", "Music can keep playing. Checking the local server again shortly.");
-        await delay(1000);
+        // A disconnected bridge cannot stop music at the next wake. Fail closed
+        // now and require explicit reconnection instead of retaining playback
+        // through an uncertain gap or replaying old commands after recovery.
+        loseConnection("The local connection was interrupted. Reconnect Apple Music before requesting playback.");
+        return;
       } finally {
         if (state.pollAbort === abort) state.pollAbort = null;
       }
@@ -980,18 +1030,15 @@
     state.sessionId = null;
     state.requestNumber += 1;
     state.requestBusy = false;
+    const stopping = holdAndPauseLocalPlayback();
     controls();
     try {
-      const music = state.music;
-      const generation = state.generation;
-      try { if (music) dispatchSDKPause(() => state.music === music && state.generation === generation && !state.sessionId,
-        performance.now() + 2000, music).catch(() => {}); } catch (_) { /* Still revoke the session. */ }
       const revoke = sessionId ? api("/v1/player/disconnect", { method: "POST", body: { session_id: sessionId }, timeout: 3000 }) : Promise.resolve();
       const signOut = state.music ? beforeDeadline(Promise.resolve().then(() => state.music.unauthorize()), performance.now() + 5000) : Promise.resolve();
-      const outcomes = await Promise.allSettled([revoke, signOut]);
-      const incomplete = outcomes.some((outcome) => outcome.status === "rejected");
+      const outcomes = await Promise.allSettled([revoke, signOut, stopping]);
+      const incomplete = outcomes.some((outcome) => outcome.status === "rejected") || outcomes[2].value !== true;
       connection(incomplete ? "error" : "ready", "Player disconnected", incomplete
-        ? "The local player stopped. Apple Music sign-out could not be confirmed; close this tab if needed."
+        ? "Pause or sign-out could not be confirmed. Stop audio using the browser's controls or close this tab."
         : "Connect Apple Music whenever you want to listen again.");
     } finally {
       state.disconnecting = false;
@@ -999,7 +1046,6 @@
       state.queueReady = false;
       ui.candidates.replaceChildren();
       ui.candidates.hidden = true;
-      ui.playerNote.textContent = "A browser may ask you to start playback with a click.";
       result("Connect Apple Music to get started.");
       renderPlayer();
     }
@@ -1064,7 +1110,7 @@
   }
 
   ui.start.addEventListener("click", () => {
-    if (!authorized() || !state.requestedTrack || !state.queueReady ||
+    if (!state.sessionId || !authorized() || !state.requestedTrack || !state.queueReady ||
         !queueMatches(state.music.queue, state.requestedTrack) || state.manualStarting) return;
     state.manualStarting = true;
     const abort = new AbortController();

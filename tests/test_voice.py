@@ -146,7 +146,8 @@ class VoiceTests(unittest.TestCase):
         speech.reset.assert_not_called()
 
     def test_unconfirmed_pause_does_not_submit_music_as_a_command(self):
-        for outcome in ({"status": "unknown"}, {"status": "paused", "playing": True}, None):
+        for outcome in ({"status": "unknown"}, {"status": "paused", "playing": True},
+                        {"status": "unavailable"}, {"status": "unavailable", "reason": "unexpected"}, None):
             with self.subTest(outcome=outcome):
                 microphone, detector, speech = MagicMock(), MagicMock(), MagicMock()
                 microphone.read.return_value = FRAME
@@ -155,6 +156,46 @@ class VoiceTests(unittest.TestCase):
                                                 pause_music=lambda: outcome)
                 self.assertEqual((state, audio), ('pause_failed', None))
                 self.assertEqual(microphone.read.call_count, 1)
+
+    def test_disconnected_or_unsupported_player_cannot_be_treated_as_quiet(self):
+        for follow_up in (False, True):
+            for reason in ('disconnected', 'unsupported'):
+                with self.subTest(follow_up=follow_up, reason=reason):
+                    microphone, detector, speech = MagicMock(), MagicMock(), MagicMock()
+                    microphone.read.return_value = FRAME
+                    detector.detect.return_value = True
+                    pause = MagicMock(return_value={'status': 'unavailable', 'reason': reason,
+                        'accepted': False, 'playing': None, 'was_playing': None,
+                        'message': 'private-response-token'})
+                    with self.assertRaises(MusicPauseFailure) as caught:
+                        if follow_up:
+                            wait_for_reply(microphone, speech, VoiceConfig(), pause_music=pause)
+                        else:
+                            wait_for_command(microphone, detector, speech, VoiceConfig(), pause_music=pause)
+                    self.assertEqual(caught.exception.reason, reason)
+                    self.assertNotIn('private-response-token', str(caught.exception))
+                    self.assertEqual(microphone.read.call_count, 0 if follow_up else 1)
+                    pause.assert_called_once()
+
+    def test_no_configured_music_provider_still_allows_wake_and_followup_capture(self):
+        from apm.music import MusicService
+        for follow_up in (False, True):
+            with self.subTest(follow_up=follow_up):
+                microphone, detector, speech = MagicMock(), MagicMock(), MagicMock()
+                # Follow-ups wait for quiet; a wake retains its immediate pre-roll.
+                prefix = [SILENCE] * 3 if follow_up else [FRAME]
+                microphone.read.side_effect = prefix + [FRAME] * 4 + [SILENCE] * 4
+                speech.is_speech.side_effect = [False if follow_up else True] * len(prefix) + [True] * 4 + [False] * 4
+                detector.detect.return_value = True
+                music = MusicService()
+                self.addCleanup(music.close)
+                config = VoiceConfig(silence_seconds=0.32)
+                if follow_up:
+                    state, audio = wait_for_reply(microphone, speech, config, pause_music=music.pause)
+                else:
+                    state, audio = wait_for_command(microphone, detector, speech, config, pause_music=music.pause)
+                self.assertEqual(state, 'complete')
+                self.assertIsNotNone(audio)
 
     def test_known_pause_failures_propagate_fixed_recovery_without_capturing(self):
         recovery = {

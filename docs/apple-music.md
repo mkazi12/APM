@@ -47,9 +47,13 @@ During playback, a detected “Hey Gemma” pauses the browser player before APM
 
 The current player advertises protocol version 3 when connecting, supporting both pause and resume. Version 2 supports pause only; version 1 supports neither control. An unsupported control returns `unknown` with `player_update_required`, rather than claiming success. Voice mode stops capture and returns to text after a single unconfirmed wake-time pause, so a broken connection cannot repeatedly trigger the same warning. Reload and reconnect the player, then enter `/voice` again. An already-quiet player confirms its idle state without invoking Apple's pause method unnecessarily.
 
+Losing the local connection requests a pause and cancels pending starts, including when another player tab replaces the session. A failed command poll also stops automatic recovery: reconnect explicitly before playing again. APM does not treat a disconnected player as proof of silence; voice capture stays closed until the selected player reconnects and confirms pause. Pause or close any old player tabs as well. Voice still works normally when no music provider is configured.
+
 Pause controls local media and does not require a valid Apple Music authorization. If sign-in ages out while playback is completed or paused, the player can still confirm that it is quiet and voice questions continue normally. Active playback must actually stop before confirmation, and an unresolved startup still blocks confirmation. New play/resume requests continue to require authorization. Even when authorization is lost, pause failures are reported to the local bridge instead of silently dropping the response.
 
 MusicKit v3 suppresses repeated public `play()` or `pause()` calls within 250 ms. The player spaces actual calls to the same method by at least 255 ms, coalescing pending pauses and preserving each command's original deadline. This only delays closely spaced repeats; it does not add a fixed delay to ordinary controls or retry playback. A newer pause cancels a resume still waiting to invoke the SDK.
+
+A pause also cancels earlier song requests that are still searching the catalog. Their eventual search results cannot restart playback; a new explicit play or resume request is required.
 
 To test the controls, play a song, say “Hey Gemma, pause the music,” and wait for “Music paused.” Then say “Hey Gemma, continue playing the music.” Resume uses the currently loaded song and position without repeating the catalog search. If the page was refreshed and its queue is empty, request a song first. After installing these tools, restart APM once so Gemma receives the new tool definitions, and refresh/reconnect the player page to load resume support.
 

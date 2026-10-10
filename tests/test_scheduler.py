@@ -70,6 +70,25 @@ class FakeService:
 
 
 class SchedulerTests(unittest.TestCase):
+    def test_rearmed_old_deadline_does_not_block_unrelated_alarm_delivery(self):
+        now = datetime(2026, 10, 7, 12, tzinfo=timezone.utc)
+        service = TaskService(":memory:", timezone="UTC", now=lambda: now)
+        self.addCleanup(service.close)
+        rearmed = service.create_timer("Rearmed timer", 30)
+        now += timedelta(seconds=30)
+        old = service.process_due()[0]
+        now -= timedelta(seconds=30)  # Host wall-clock correction.
+        service.snooze_task(rearmed["id"], 30)
+        healthy = service.create_timer("Independent timer", 40)
+        now += timedelta(seconds=41)
+        received = []
+        scheduler = Scheduler(service, sink=lambda event: received.append(event))
+        self.assertEqual(scheduler.run_once(), 2)
+        self.assertEqual({event["task_id"] for event in received}, {rearmed["id"],healthy["id"]})
+        self.assertNotIn(old["id"], [event["id"] for event in received])
+        self.assertIsNone(scheduler.last_error)
+        self.assertEqual(scheduler.run_once(), 0)
+
     def test_sqlite_worker_delivers_other_alarm_after_per_event_sink_failure(self):
         now = datetime(2026, 10, 7, 12, tzinfo=timezone.utc)
         service = TaskService(":memory:", timezone="UTC", now=lambda: now)

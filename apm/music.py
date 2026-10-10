@@ -8,11 +8,12 @@ short lived, and consumed before attempting playback, including failed calls.
 from __future__ import annotations
 
 from collections import OrderedDict
+from contextlib import contextmanager
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 import math
 import re
-from threading import RLock
+from threading import Event, RLock
 import time
 from typing import Protocol
 import unicodedata
@@ -187,7 +188,32 @@ class MusicService:
         self._now_source = time.monotonic if now is None else now
         self._lock = RLock()
         self._selections = OrderedDict()
+        self._play_intents = set()
         self._closed = False
+
+    @contextmanager
+    def _play_intent(self):
+        """Keep cancellation alive through search and the provider handoff."""
+        cancelled = Event()
+        with self._lock:
+            self._play_intents.add(cancelled)
+            if self._closed:
+                cancelled.set()
+        try:
+            yield cancelled
+        finally:
+            with self._lock:
+                self._play_intents.discard(cancelled)
+
+    def _cancel_older_plays(self):
+        with self._lock:
+            for cancelled in self._play_intents:
+                cancelled.set()
+
+    def _cancelled_play(self):
+        error = MusicPlaybackError("cancelled")
+        return self._result("unknown", accepted=None, playing=None,
+                            reason=error.reason, message=error.user_message())
 
     def status(self):
         return {"configured": self._provider is not None and not self._closed,
@@ -362,14 +388,23 @@ class MusicService:
                             message="Choose a recording or specify its artist and version before playback.")
 
     def play(self, title, artist=None, version=None):
-        result = self._resolve(title, artist, version, choose_first=True)
-        if result["status"] != "matched":
-            return result
-        return self.select(result["track"]["selection_id"])
+        with self._play_intent() as cancelled:
+            result = self._resolve(title, artist, version, choose_first=True)
+            if result["status"] == "not_configured":
+                return result
+            if cancelled.is_set():
+                if result["status"] == "matched":
+                    with self._lock:
+                        self._selections.pop(result["track"]["selection_id"], None)
+                return self._cancelled_play()
+            if result["status"] != "matched":
+                return result
+            return self._select(result["track"]["selection_id"], cancelled)
 
     def pause(self):
-        """Pause without a catalog request; absence is a safe, explicit no-op."""
+        """Pause without searching; disconnected players are not proof of silence."""
         self.validate_request("pause", {})
+        self._cancel_older_plays()
         fields = {"accepted": False, "playing": None, "was_playing": None}
         if self._closed or self._provider is None:
             return self._result("unavailable", reason="not_configured", **fields,
@@ -403,6 +438,10 @@ class MusicService:
 
     def resume(self):
         """Resume the provider's existing queue without searching or replacing it."""
+        with self._play_intent() as cancelled:
+            return self._resume(cancelled)
+
+    def _resume(self, cancelled):
         self.validate_request("resume", {})
         fields = {"accepted": False, "playing": None}
         if self._closed or self._provider is None:
@@ -413,7 +452,10 @@ class MusicService:
             return self._result("unavailable", reason="unsupported", **fields,
                                 message="The music provider does not support resume.")
         try:
-            result = resume()
+            if cancelled.is_set():
+                raise MusicPlaybackError("cancelled")
+            guarded = getattr(self._provider, "resume_guarded", None)
+            result = guarded(cancelled) if callable(guarded) else resume()
             if (not isinstance(result, PlaybackResult) or type(result.accepted) is not bool
                     or (result.playing is not None and type(result.playing) is not bool)
                     or result.was_playing is not None):
@@ -442,6 +484,10 @@ class MusicService:
                             message="Music resume could not be confirmed. The request was not retried.")
 
     def select(self, selection_id):
+        with self._play_intent() as cancelled:
+            return self._select(selection_id, cancelled)
+
+    def _select(self, selection_id, cancelled):
         self.validate_request("select", {"selection_id": selection_id})
         with self._lock:
             if not self.status()["configured"]:
@@ -453,7 +499,13 @@ class MusicService:
             _, track, query = selection
         metadata = self._public(track)
         try:
-            result = self._provider.play(track.id)
+            if cancelled.is_set():
+                raise MusicPlaybackError("cancelled")
+            # MusicKit checks this token inside its command-enqueue lock. This
+            # closes the gap between our check and a concurrent confirmed pause,
+            # without holding this service's lock during provider/network I/O.
+            guarded = getattr(self._provider, "play_guarded", None)
+            result = guarded(track.id, cancelled) if callable(guarded) else self._provider.play(track.id)
             if (not isinstance(result, PlaybackResult) or type(result.accepted) is not bool
                     or (result.playing is not None and type(result.playing) is not bool)
                     or (result.track_id is not None and not isinstance(result.track_id, str))):
@@ -479,6 +531,8 @@ class MusicService:
             if self._closed:
                 return
             self._closed = True
+            for cancelled in self._play_intents:
+                cancelled.set()
             self._selections.clear()
         if self._provider is not None:
             try:
